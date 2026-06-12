@@ -22,6 +22,7 @@ with any multimodal model whose processor supports the standard conversation
 schema and optional `images` argument.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -50,8 +51,9 @@ class MockVLMConversationProvider(DatasetProvider):
 
     # Sample generation options
     prompt: str = "Describe this image."
+    ratio: float = 1.0
     random_seed: int = 0
-    image_size: Tuple[int, int] = (256, 256)
+    image_size: Tuple[int, int] = (768, 768)
     pad_to_max_length: bool = True
     create_attention_mask: bool = True
 
@@ -71,10 +73,14 @@ class MockVLMConversationProvider(DatasetProvider):
     pack_sequences_in_batch: bool = False
 
     def _make_single_example(
-        self, rng: numpy.random.Generator, prompt_text: str, response_text: str
+        self,
+        rng: numpy.random.Generator,
+        prompt_text: str,
+        response_text: str,
+        num_images: int | None = None,
     ) -> Dict[str, Any]:
         """Create a single mock conversation example with the given prompt and response text."""
-        num_images = max(0, int(getattr(self, "num_images", 1)))
+        num_images = max(0, int(self.num_images if num_images is None else num_images))
         w, h = self.image_size
         images = None
         if num_images > 0:
@@ -90,6 +96,12 @@ class MockVLMConversationProvider(DatasetProvider):
             {"role": "assistant", "content": [{"type": "text", "text": response_text}]},
         ]
         return {"conversation": messages}
+
+    def _image_tokens_per_image(self) -> int:
+        w, h = self.image_size
+        patch_size = 16
+        spatial_merge_size = 2
+        return max(1, math.ceil(w / patch_size) * math.ceil(h / patch_size) // spatial_merge_size**2)
 
     def _make_base_examples(self) -> List[Dict[str, Any]]:
         rng = numpy.random.default_rng(seed=self.random_seed)
@@ -110,20 +122,18 @@ class MockVLMConversationProvider(DatasetProvider):
 
         num_examples = 1000
 
-        if self.pack_sequences_in_batch:
-            # When packing is enabled, produce examples with varied response lengths
-            # so that the packing logic concatenates sequences of different sizes.
-            resp_len_range = (10, 100)
-        else:
-            # Without packing, keep responses short (10-30 words) to maintain similar
-            # sequence lengths, since the collate pads to batch-max.
-            resp_len_range = (10, 30)
+        images_per_unit = max(1, int(getattr(self, "num_images", 1)))
+        image_tokens = images_per_unit * self._image_tokens_per_image()
+        words_per_unit = max(1, math.ceil(image_tokens * max(0.0, float(self.ratio))))
+        perlen = image_tokens + words_per_unit
+        repeats = max(1, math.ceil(int(self.seq_length) / perlen))
 
         examples = []
         for _ in range(num_examples):
-            resp_len = int(rng.integers(*resp_len_range))
-            response = " ".join(rng.choice(_VOCAB, size=resp_len))
-            examples.append(self._make_single_example(rng, self.prompt, response))
+            response = " ".join(rng.choice(_VOCAB, size=words_per_unit * repeats))
+            examples.append(
+                self._make_single_example(rng, self.prompt, response, images_per_unit * repeats)
+            )
 
         return examples
 
