@@ -23,15 +23,29 @@ schema and optional `images` argument.
 """
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy
+import torch
 from PIL import Image
 
 from megatron.bridge.data.vlm_datasets.conversation_dataset import VLMConversationDataset
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.bridge.training.config import DatasetBuildContext, DatasetProvider
+from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
+
+
+class _CachedBatchIterator(Iterator[Dict[str, Any]]):
+    def __init__(self, batch: Dict[str, Any]) -> None:
+        self.batch = batch
+
+    def __next__(self) -> Dict[str, Any]:
+        batch = self.batch.copy()
+        batch["visual_inputs"] = GenericVisualInputs(**batch["visual_inputs"])
+        return batch
 
 
 @dataclass(kw_only=True)
@@ -72,6 +86,10 @@ class MockVLMConversationProvider(DatasetProvider):
     # Enable batch-level online sequence packing
     pack_sequences_in_batch: bool = False
 
+    # Optional fully-collated microbatch cache.
+    cache_path: Optional[str] = None
+    cache_micro_batch_size: Optional[int] = None
+
     def _make_single_example(
         self,
         rng: numpy.random.Generator,
@@ -103,7 +121,7 @@ class MockVLMConversationProvider(DatasetProvider):
         spatial_merge_size = 2
         return max(1, math.ceil(w / patch_size) * math.ceil(h / patch_size) // spatial_merge_size**2)
 
-    def _make_base_examples(self) -> List[Dict[str, Any]]:
+    def _make_base_examples(self, num_examples: int = 1000) -> List[Dict[str, Any]]:
         rng = numpy.random.default_rng(seed=self.random_seed)
 
         # Generate many diverse examples with random responses so the model
@@ -119,8 +137,6 @@ class MockVLMConversationProvider(DatasetProvider):
             "there where when how what which who whom whose each every all both few "
             "many much some any no other another such"
         ).split()
-
-        num_examples = 1000
 
         images_per_unit = max(1, int(getattr(self, "num_images", 1)))
         image_tokens = images_per_unit * self._image_tokens_per_image()
@@ -138,6 +154,25 @@ class MockVLMConversationProvider(DatasetProvider):
         return examples
 
     def build_datasets(self, context: DatasetBuildContext):
+        if self.cache_path is not None:
+            if self.cache_micro_batch_size is None:
+                raise ValueError("cache_micro_batch_size must be set when cache_path is used")
+            batch = torch.load(Path(self.cache_path), map_location="cpu", weights_only=True)
+            if batch["input_ids"].shape[0] != self.cache_micro_batch_size:
+                raise ValueError(
+                    f"Cached batch has MBS={batch['input_ids'].shape[0]}, expected {self.cache_micro_batch_size}"
+                )
+            self.dataloader_type = "external"
+
+            def _maybe_make_cached(size: int) -> Optional[_CachedBatchIterator]:
+                return _CachedBatchIterator(batch) if size > 0 else None
+
+            return (
+                _maybe_make_cached(context.train_samples),
+                _maybe_make_cached(context.valid_samples),
+                _maybe_make_cached(context.test_samples),
+            )
+
         from transformers import AutoProcessor
 
         # Initialize and store processor
