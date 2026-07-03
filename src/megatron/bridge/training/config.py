@@ -1275,6 +1275,14 @@ class ConfigContainer(Container):
         _validate_mixed_precision_consistency(self)
         _validate_fine_grained_activation_offloading(self)
 
+        # Megatron FSDP requires layer hooks that TE per-layer CUDA graphs reject during capture.
+        if is_fsdp and self.model.cuda_graph_impl == "transformer_engine":
+            raise ValueError(
+                "Megatron FSDP does not support Transformer Engine per-layer CUDA graphs because "
+                "FSDP requires hooks on transformer layers. Use full-iteration CUDA graphs or disable "
+                "CUDA graphs."
+            )
+
         # CUDA graph scope validation: check_for_nan_in_loss must be disabled with full_iteration graph
         if is_full_iteration_cuda_graph(self.model):
             assert not self.rerun_state_machine.check_for_nan_in_loss, (
