@@ -147,9 +147,7 @@ class MockVLMConversationProvider(DatasetProvider):
         examples = []
         for _ in range(num_examples):
             response = " ".join(rng.choice(_VOCAB, size=words_per_unit * repeats))
-            examples.append(
-                self._make_single_example(rng, self.prompt, response, images_per_unit * repeats)
-            )
+            examples.append(self._make_single_example(rng, self.prompt, response, images_per_unit * repeats))
 
         return examples
 

@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--micro-batch-size", required=True, type=int)
     return parser.parse_args()
 
+
 def prepare_cache(args: argparse.Namespace) -> None:
     """Generate one cached mock microbatch unless it already exists.
 

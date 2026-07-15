@@ -254,6 +254,68 @@ class TestTrainingLog:
             assert key in total_loss_dict
             torch.testing.assert_close(total_loss_dict[key], loss_dict[key])
 
+    @mock.patch("megatron.bridge.training.utils.train_utils.num_floating_point_operations")
+    @mock.patch("megatron.bridge.training.utils.train_utils.get_num_microbatches")
+    @mock.patch("megatron.bridge.training.utils.train_utils.reduce_max_stat_across_model_parallel_group")
+    @mock.patch("megatron.bridge.training.utils.train_utils.get_world_size_safe")
+    @mock.patch("megatron.bridge.training.utils.train_utils.print_rank_0")
+    @mock.patch("megatron.bridge.training.utils.train_utils.print_rank_last")
+    def test_fixed_length_fallback_preserves_vision_flops(
+        self,
+        mock_print_rank_last,
+        mock_print_rank_0,
+        mock_get_world_size,
+        mock_reduce_lr,
+        mock_get_microbatches,
+        mock_num_flops,
+        mock_config,
+        mock_global_state,
+        loss_dict,
+    ):
+        """Vision patch metadata must reach the FLOPs fallback when sequence stats are absent."""
+        mock_get_microbatches.return_value = 8
+        mock_reduce_lr.return_value = 1e-4
+        mock_get_world_size.return_value = 32
+        mock_num_flops.return_value = 123
+
+        mock_config.logger.log_interval = 1
+        mock_config.logger.log_timers_to_tensorboard = False
+        mock_config.logger.log_throughput = True
+        mock_global_state.tensorboard_logger = None
+        mock_global_state.wandb_logger = None
+        mock_global_state.mlflow_logger = None
+        mock_global_state.comet_logger = None
+        mock_global_state.train_state.step = 1
+        mock_global_state._flops_seqlen_sum = 0
+        mock_global_state._flops_seqlen_sq_sum = 0
+        mock_global_state._flops_vision_patches = 11
+        mock_global_state._flops_vision_patches_sq_sum = 13
+
+        training_log(
+            loss_dict=loss_dict,
+            total_loss_dict=self.get_fresh_total_loss_dict(),
+            learning_rate=1e-4,
+            decoupled_learning_rate=None,
+            loss_scale=1024.0,
+            report_memory_flag=False,
+            skipped_iter=0,
+            grad_norm=2.5,
+            params_norm=15.2,
+            num_zeros_in_grad=0,
+            config=mock_config,
+            global_state=mock_global_state,
+            history_wct=None,
+            model=None,
+            seq_length=None,
+        )
+
+        mock_num_flops.assert_called_once_with(
+            mock_config,
+            64,
+            num_vision_patches=44,
+            vision_patches_squared_sum=52,
+        )
+
     @mock.patch("megatron.bridge.training.utils.train_utils.get_num_microbatches")
     @mock.patch("megatron.bridge.training.utils.train_utils.reduce_max_stat_across_model_parallel_group")
     @mock.patch("megatron.bridge.training.utils.train_utils.get_world_size_safe")

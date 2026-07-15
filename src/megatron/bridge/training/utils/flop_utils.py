@@ -75,9 +75,7 @@ def vit_flops(
         # = 2 * 2 * h * intermediate = 4 * h * intermediate
         + 4 * hidden_size * intermediate_size
     )
-    transformer_flops_val = (
-        linear_flops_per_patch * total_patches + 4 * hidden_size * patches_squared_sum
-    ) * depth
+    transformer_flops_val = (linear_flops_per_patch * total_patches + 4 * hidden_size * patches_squared_sum) * depth
 
     # Patch Merger: spatial merge (2x2) + MLP projection
     merge_unit = spatial_merge_size**2

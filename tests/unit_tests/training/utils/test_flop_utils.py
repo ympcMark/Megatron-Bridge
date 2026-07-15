@@ -1458,14 +1458,10 @@ class TestVitFlops:
         )
         num_patches = 64
         linear_per_patch = 8 * vision.hidden_size**2 + 4 * vision.hidden_size * vision.intermediate_size
-        transformer = vision.depth * (
-            linear_per_patch * num_patches + 4 * vision.hidden_size * num_patches**2
-        )
+        transformer = vision.depth * (linear_per_patch * num_patches + 4 * vision.hidden_size * num_patches**2)
         merge_unit = vision.spatial_merge_size**2
         merged_hidden = vision.hidden_size * merge_unit
-        merger = num_patches / merge_unit * (
-            2 * merged_hidden**2 + 2 * merged_hidden * vision.out_hidden_size
-        )
+        merger = num_patches / merge_unit * (2 * merged_hidden**2 + 2 * merged_hidden * vision.out_hidden_size)
 
         assert vit_flops(cfg, batch_size=1, num_patches=num_patches) == transformer + 4 * merger * 2
 

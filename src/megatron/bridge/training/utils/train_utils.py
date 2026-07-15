@@ -1138,7 +1138,12 @@ def training_log(
                     vision_patches_squared_sum=vision_patches_squared_sum,
                 )
             else:
-                num_flops = num_floating_point_operations(config, batch_size)
+                num_flops = num_floating_point_operations(
+                    config,
+                    batch_size,
+                    num_vision_patches=num_vision_patches,
+                    vision_patches_squared_sum=vision_patches_squared_sum,
+                )
             per_gpu_tf = num_flops / elapsed_time_per_iteration / get_world_size_safe() / 1e12
             print_rank_0(
                 f"Step Time : {elapsed_time_per_iteration:.2f}s GPU utilization: {per_gpu_tf:.1f}MODEL_TFLOP/s/GPU"
