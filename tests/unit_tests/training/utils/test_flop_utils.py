@@ -33,6 +33,7 @@ class MockVisionConfig:
     intermediate_size: int = 4096
     spatial_merge_size: int = 2
     out_hidden_size: int = 4096
+    deepstack_visual_indexes: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -101,6 +102,8 @@ class MockModelConfig:
     linear_num_value_heads: int = 48
     # Optional ViT vision config (for VLM FLOPS tests)
     vision_config: object | None = None
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
 
     def __post_init__(self):
         import torch.nn.functional as F
@@ -1435,6 +1438,37 @@ class TestVitFlops:
         f_high = vit_flops(cfg, batch_size=1, num_patches=64)
         assert f_high > 2 * f_low, "Attention quadratic term must make doubling patches > 2x FLOPS"
 
+    def test_vit_flops_respects_frozen_encoder_and_deepstack_mergers(self):
+        """A frozen encoder is forward-only while trainable Qwen3-VL mergers include backward FLOPs."""
+        vision = MockVisionConfig(
+            depth=2,
+            hidden_size=128,
+            intermediate_size=256,
+            spatial_merge_size=2,
+            out_hidden_size=512,
+            deepstack_visual_indexes=[0, 1, 2],
+        )
+        cfg = MockConfigContainer(
+            model=MockModelConfig(
+                hidden_size=512,
+                vision_config=vision,
+                freeze_vision_model=True,
+                freeze_vision_projection=False,
+            )
+        )
+        num_patches = 64
+        linear_per_patch = 8 * vision.hidden_size**2 + 4 * vision.hidden_size * vision.intermediate_size
+        transformer = vision.depth * (
+            linear_per_patch * num_patches + 4 * vision.hidden_size * num_patches**2
+        )
+        merge_unit = vision.spatial_merge_size**2
+        merged_hidden = vision.hidden_size * merge_unit
+        merger = num_patches / merge_unit * (
+            2 * merged_hidden**2 + 2 * merged_hidden * vision.out_hidden_size
+        )
+
+        assert vit_flops(cfg, batch_size=1, num_patches=num_patches) == transformer + 4 * merger * 2
+
     def test_vit_flops_out_hidden_size_defaults_to_model_hidden_size(self):
         """When vision_config lacks out_hidden_size, fall back to cfg.model.hidden_size."""
 
@@ -1602,15 +1636,22 @@ class TestDynamicSeqLenFlops:
             )
         )
         batch_size = 2
+        vision_patches_squared_sum = 4 * 32**2
         llm_only = num_floating_point_operations(cfg_vlm, batch_size=batch_size)
         vlm_flops = num_floating_point_operations(
             cfg_vlm,
             batch_size=batch_size,
             num_vision_patches=128,
+            vision_patches_squared_sum=vision_patches_squared_sum,
         )
         assert vlm_flops > llm_only
         # ViT-only path matches the delta (invoked with per-image patches)
-        vit_only = vit_flops(cfg_vlm, batch_size=batch_size, num_patches=128 / batch_size)
+        vit_only = vit_flops(
+            cfg_vlm,
+            batch_size=batch_size,
+            num_patches=128 / batch_size,
+            patches_squared_sum=vision_patches_squared_sum,
+        )
         assert vlm_flops - llm_only == vit_only
 
     def test_num_vision_patches_zero_has_no_effect(self):

@@ -1093,19 +1093,27 @@ def training_log(
             local_seqlen_sum = getattr(global_state, "_flops_seqlen_sum", 0)
             local_seqlen_sq_sum = getattr(global_state, "_flops_seqlen_sq_sum", 0)
             local_vision_patches = getattr(global_state, "_flops_vision_patches", 0)
+            local_vision_patches_sq_sum = getattr(global_state, "_flops_vision_patches_sq_sum", 0)
             if not isinstance(local_seqlen_sum, int):
                 local_seqlen_sum = 0
             if not isinstance(local_seqlen_sq_sum, int):
                 local_seqlen_sq_sum = 0
             if not isinstance(local_vision_patches, int):
                 local_vision_patches = 0
-            num_vision_patches = local_vision_patches * config.data_parallel_size if local_vision_patches > 0 else 0
+            if not isinstance(local_vision_patches_sq_sum, int):
+                local_vision_patches_sq_sum = 0
 
             vp_size = getattr(config.model, "virtual_pipeline_model_parallel_size", None)
             if isinstance(vp_size, int) and vp_size > 1:
                 local_seqlen_sum = local_seqlen_sum // vp_size
                 local_seqlen_sq_sum = local_seqlen_sq_sum // vp_size
-                num_vision_patches = num_vision_patches // vp_size
+                local_vision_patches = local_vision_patches // vp_size
+                local_vision_patches_sq_sum = local_vision_patches_sq_sum // vp_size
+
+            num_vision_patches = local_vision_patches * config.data_parallel_size if local_vision_patches > 0 else 0
+            vision_patches_squared_sum = (
+                local_vision_patches_sq_sum * config.data_parallel_size if local_vision_patches_sq_sum > 0 else 0
+            )
 
             if local_seqlen_sum > 0:
                 seqlen_sum = local_seqlen_sum * config.data_parallel_size
@@ -1116,6 +1124,7 @@ def training_log(
                     seqlen_sum=seqlen_sum,
                     seqlen_squared_sum=seqlen_squared_sum,
                     num_vision_patches=num_vision_patches,
+                    vision_patches_squared_sum=vision_patches_squared_sum,
                 )
             elif seq_length is not None:
                 seqlen_sum = batch_size * seq_length
@@ -1126,6 +1135,7 @@ def training_log(
                     seqlen_sum=seqlen_sum,
                     seqlen_squared_sum=seqlen_squared_sum,
                     num_vision_patches=num_vision_patches,
+                    vision_patches_squared_sum=vision_patches_squared_sum,
                 )
             else:
                 num_flops = num_floating_point_operations(config, batch_size)

@@ -494,8 +494,15 @@ def forward_step(
         for attr in ("image_grid_thw", "video_grid_thw"):
             grid = getattr(visual_inputs, attr, None)
             if grid is not None and grid.numel() > 0:
-                state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + int(
-                    grid.prod(dim=-1).sum().item()
+                grid = grid.to(torch.int64)
+                patches = grid.prod(dim=-1)
+                spatial_patches = grid[:, 1:].prod(dim=-1)
+                patch_sum, patch_square_sum = torch.stack(
+                    (patches.sum(), (grid[:, 0] * spatial_patches * spatial_patches).sum())
+                ).tolist()
+                state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + patch_sum
+                state._flops_vision_patches_sq_sum = getattr(state, "_flops_vision_patches_sq_sum", 0) + int(
+                    patch_square_sum
                 )
 
     forward_args = {

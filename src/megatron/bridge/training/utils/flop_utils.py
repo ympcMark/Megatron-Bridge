@@ -27,7 +27,9 @@ _lora_seq_stats_cache: dict = {}
 def vit_flops(
     cfg: ConfigContainer,
     batch_size: int,
-    num_patches: int,
+    num_patches: int | float,
+    *,
+    patches_squared_sum: int | float | None = None,
 ):
     """Calculate FLOPs for a Vision Transformer (ViT) encoder + patch merger.
 
@@ -42,15 +44,14 @@ def vit_flops(
             ``out_hidden_size``). Passing the whole config keeps the public
             signature stable as the list of required ViT attributes grows.
         batch_size: Batch size.
-        num_patches: Per-image number of vision patches (before spatial
-            merge). Callers that track the total patch count across the
-            batch should divide by ``batch_size`` before invoking, because
-            ViT attention is per-image (not cross-image) and scales
-            quadratically with the per-image patch count.
+        num_patches: Average number of vision patches per sample before
+            spatial merge.
+        patches_squared_sum: Sum of squared patch counts for every vision
+            attention sequence in the batch.
 
     Returns:
-        Total training FLOPs (forward * 3 for fwd+bwd). Returns 0 when
-        no ``vision_config`` is attached or ``num_patches`` is non-positive.
+        Total vision FLOPs. Returns 0 when no ``vision_config`` is attached
+        or ``num_patches`` is non-positive.
     """
     vision_config = getattr(cfg.model, "vision_config", None)
     if vision_config is None or num_patches <= 0:
@@ -61,31 +62,38 @@ def vit_flops(
     intermediate_size = getattr(vision_config, "intermediate_size", 0)
     spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
     out_hidden_size = getattr(vision_config, "out_hidden_size", cfg.model.hidden_size)
+    total_patches = batch_size * num_patches
+    if patches_squared_sum is None:
+        patches_squared_sum = batch_size * num_patches**2
 
     # ViT Transformer layers (bidirectional attention)
-    per_token_per_layer = (
+    linear_flops_per_patch = (
         # QKV + O projections: 4 matmuls of h x h => 4 * 2 * h^2 FMA = 8h^2
         # but standard counting: Q,K,V each h->h (3 * 2h^2) + O h->h (2h^2) = 8h^2
         8 * hidden_size**2
-        # Attention core (full bidirectional, not causal): QK^T + attn*V
-        # = 2 * 2 * h * num_patches = 4 * h * num_patches
-        + 4 * hidden_size * num_patches
         # MLP (GELU, 2 matmuls): fc1 h->intermediate + fc2 intermediate->h
         # = 2 * 2 * h * intermediate = 4 * h * intermediate
         + 4 * hidden_size * intermediate_size
     )
-    transformer_flops_val = per_token_per_layer * num_patches * depth
+    transformer_flops_val = (
+        linear_flops_per_patch * total_patches + 4 * hidden_size * patches_squared_sum
+    ) * depth
 
     # Patch Merger: spatial merge (2x2) + MLP projection
     merge_unit = spatial_merge_size**2
     merged_hidden = hidden_size * merge_unit  # concatenated hidden dim
-    num_merged_tokens = num_patches // merge_unit if merge_unit > 0 else num_patches
+    num_merged_tokens = total_patches / merge_unit if merge_unit > 0 else total_patches
     merger_flops_val = num_merged_tokens * (
         2 * merged_hidden * merged_hidden  # fc1: merged_hidden -> merged_hidden
         + 2 * merged_hidden * out_hidden_size  # fc2: merged_hidden -> out_hidden_size
     )
+    num_mergers = 1 + len(getattr(vision_config, "deepstack_visual_indexes", []) or [])
 
-    return (transformer_flops_val + merger_flops_val) * batch_size * 3  # 3x for training (fwd + bwd)
+    freeze_encoder = getattr(cfg.model, "freeze_vision_model", False)
+    freeze_projection = getattr(cfg.model, "freeze_vision_projection", False)
+    encoder_multiplier = 1 if freeze_encoder else 3
+    merger_multiplier = 1 + int(not freeze_encoder) + int(not freeze_projection)
+    return transformer_flops_val * encoder_multiplier + merger_flops_val * num_mergers * merger_multiplier
 
 
 def num_floating_point_operations(
@@ -94,6 +102,7 @@ def num_floating_point_operations(
     seqlen_sum: int | None = None,
     seqlen_squared_sum: int | None = None,
     num_vision_patches: int = 0,
+    vision_patches_squared_sum: int = 0,
 ):
     """Return the number of floating point operations.
 
@@ -111,6 +120,8 @@ def num_floating_point_operations(
             result matches the legacy constant-length estimate.
         num_vision_patches: Total number of vision patches in the batch
             (before spatial merge). Used to compute ViT encoder FLOPS.
+        vision_patches_squared_sum: Sum of squared patch counts for each vision
+            attention sequence in the batch. Used for vision attention FLOPS.
     """
     # Compute effective sequence length from actual values or fall back to config.
     if seqlen_sum is not None and batch_size > 0:
@@ -773,8 +784,13 @@ def num_floating_point_operations(
         """
         if num_vision_patches <= 0:
             return 0
-        patches_per_image = num_vision_patches / batch_size if batch_size > 0 else num_vision_patches
-        return vit_flops(cfg, batch_size, patches_per_image)
+        patches_per_sample = num_vision_patches / batch_size if batch_size > 0 else num_vision_patches
+        return vit_flops(
+            cfg,
+            batch_size,
+            patches_per_sample,
+            patches_squared_sum=vision_patches_squared_sum or None,
+        )
 
     # Main entrypoint for FLOPs calculation.
     if getattr(cfg.model, "is_hybrid_model", False):

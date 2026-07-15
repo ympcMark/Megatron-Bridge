@@ -440,6 +440,7 @@ def train(
         global_state._flops_seqlen_sum = 0
         global_state._flops_seqlen_sq_sum = 0
         global_state._flops_vision_patches = 0
+        global_state._flops_vision_patches_sq_sum = 0
 
         (
             loss_dict,
@@ -555,6 +556,7 @@ def train(
         local_seqlen_sum = getattr(global_state, "_flops_seqlen_sum", 0)
         local_seqlen_sq_sum = getattr(global_state, "_flops_seqlen_sq_sum", 0)
         num_vision_patches = getattr(global_state, "_flops_vision_patches", 0)
+        vision_patches_squared_sum = getattr(global_state, "_flops_vision_patches_sq_sum", 0)
         # Coerce to int — getattr on MagicMock test doubles returns a MagicMock
         # (not the default), which breaks the numeric comparisons below.
         if not isinstance(local_seqlen_sum, int):
@@ -563,6 +565,8 @@ def train(
             local_seqlen_sq_sum = 0
         if not isinstance(num_vision_patches, int):
             num_vision_patches = 0
+        if not isinstance(vision_patches_squared_sum, int):
+            vision_patches_squared_sum = 0
 
         # Correct for VPP over-counting: each microbatch's seqlen is accumulated
         # once per virtual stage, but FLOPS formula already covers all stages.
@@ -571,6 +575,7 @@ def train(
             local_seqlen_sum = local_seqlen_sum // vp_size
             local_seqlen_sq_sum = local_seqlen_sq_sum // vp_size
             num_vision_patches = num_vision_patches // vp_size
+            vision_patches_squared_sum = vision_patches_squared_sum // vp_size
 
         if local_seqlen_sum > 0:
             seqlen_sum = local_seqlen_sum * dp_size
@@ -582,6 +587,7 @@ def train(
 
         # Vision patches: local accumulation * dp_size for global
         num_vision_patches = num_vision_patches * dp_size if num_vision_patches > 0 else 0
+        vision_patches_squared_sum = vision_patches_squared_sum * dp_size if vision_patches_squared_sum > 0 else 0
 
         num_floating_point_operations_in_batch = flop_utils.num_floating_point_operations(
             config,
@@ -589,6 +595,7 @@ def train(
             seqlen_sum=seqlen_sum,
             seqlen_squared_sum=seqlen_squared_sum,
             num_vision_patches=num_vision_patches,
+            vision_patches_squared_sum=vision_patches_squared_sum,
         )
         global_state.train_state.floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_so_far = global_state.train_state.floating_point_operations_so_far
