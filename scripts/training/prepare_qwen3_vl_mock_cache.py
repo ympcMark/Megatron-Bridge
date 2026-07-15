@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path, help="Output .pt file")
     parser.add_argument("--seq-length", required=True, type=int)
     parser.add_argument("--micro-batch-size", required=True, type=int)
+    parser.add_argument("--ratio", type=float, default=1.0, help="Text words per estimated image token")
     return parser.parse_args()
 
 
@@ -54,6 +55,7 @@ def prepare_cache(args: argparse.Namespace) -> None:
     provider = MockVLMConversationProvider(
         seq_length=args.seq_length,
         hf_processor_path=args.hf_path,
+        ratio=args.ratio,
     )
     processor = AutoProcessor.from_pretrained(
         args.hf_path,
