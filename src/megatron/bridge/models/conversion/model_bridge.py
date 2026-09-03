@@ -40,6 +40,16 @@ from typing import (
 import torch
 from megatron.core import parallel_state
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+
+try:
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+        FullyShardedDataParallelV1,
+        FullyShardedDataParallelV2,
+    )
+
+    _MEGATRON_FSDP_TYPES = (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+except ImportError:
+    _MEGATRON_FSDP_TYPES = (FullyShardedDataParallel,)
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1051,7 +1061,7 @@ class MegatronModelBridge(
         if not isinstance(megatron_model, list):
             megatron_model = [megatron_model]
 
-        use_megatron_fsdp = isinstance(megatron_model[0], FullyShardedDataParallel)
+        use_megatron_fsdp = isinstance(megatron_model[0], _MEGATRON_FSDP_TYPES)
         if use_megatron_fsdp:
             original_megatron_model = megatron_model
         unwrapped_model_list = unwrap_model(megatron_model)

@@ -49,10 +49,19 @@ def unwrap_model(model, module_instances=None):
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
             FullyShardedDataParallel as megatron_FSDP,
         )
+        try:
+            from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+                FullyShardedDataParallelV1,
+                FullyShardedDataParallelV2,
+            )
+
+            megatron_fsdp_types = (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+        except ImportError:
+            megatron_fsdp_types = (megatron_FSDP,)
         from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
         from megatron.core.transformer.module import Float16Module
 
-        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module, MegatronFSDP)
+        module_instances = (DDP, torch_FSDP, *megatron_fsdp_types, Float16Module, MegatronFSDP)
 
     return_list = True
     if not isinstance(model, list):
