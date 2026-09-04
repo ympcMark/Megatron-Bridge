@@ -274,17 +274,27 @@ def forward_step(
     # Vision-patch count is model-specific (Qwen-VL reports grid_thw = t*h*w per
     # image/video); compute it here and pass a scalar to the model-agnostic helper.
     num_vision_patches = None
+    vision_patches_squared_sum = None
     if isinstance(multi_modal_inputs, dict):
         for grid in (multi_modal_inputs.get("image_grid_thw"), multi_modal_inputs.get("video_grid_thw")):
             if grid is not None and grid.numel() > 0:
+                grid = grid.to(dtype=torch.int64)
                 patches = grid.prod(dim=-1).sum()
+                spatial_patches = grid[:, 1:].prod(dim=-1)
+                patches_squared = (grid[:, 0] * spatial_patches.square()).sum()
                 num_vision_patches = patches if num_vision_patches is None else num_vision_patches + patches
+                vision_patches_squared_sum = (
+                    patches_squared
+                    if vision_patches_squared_sum is None
+                    else vision_patches_squared_sum + patches_squared
+                )
     accumulate_flops_metadata(
         state,
         tokens,
         vp_stage=get_model_chunk_vp_stage(model),
         cu_seqlens=getattr(packed_seq_params, "cu_seqlens_q", None) if packed_seq_params is not None else None,
         num_vision_patches=num_vision_patches,
+        vision_patches_squared_sum=vision_patches_squared_sum,
     )
 
     forward_args = {

@@ -313,7 +313,7 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
 
         language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=self.num_moe_experts,
-            moe_grouped_gemm=True,
+            moe_grouped_gemm=self.moe_grouped_gemm,
             qk_layernorm=self.qk_layernorm,
             fp8=False,
         )

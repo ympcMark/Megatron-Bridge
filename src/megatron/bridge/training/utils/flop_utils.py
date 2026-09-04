@@ -67,13 +67,14 @@ def resolve_global_flops_seqlen_stats(
     data_parallel_size: int,
     vp_size: int | None = None,
     dp_group=None,
-) -> tuple[int | None, int | None, int]:
+) -> tuple[int | None, int | None, int, int]:
     """Resolve data-parallel-global FLOPS sequence stats from per-rank accumulators.
 
-    Reads the three accumulators populated by the forward step
+    Reads the four accumulators populated by the forward step
     (``_flops_seqlen_sum`` = Σ padded tokens, ``_flops_seqlen_sq_sum`` = Σᵢ sᵢ²
-    over real sub-sequences, ``_flops_vision_patches``) and reduces them to
-    global totals across the data-parallel group.
+    over real sub-sequences, ``_flops_vision_patches`` = Σᵢ pᵢ, and
+    ``_flops_vision_patches_sq_sum`` = Σᵢ pᵢ²) and reduces them to global totals
+    across the data-parallel group.
 
     Under variable-length (THD packed) training the per-rank ``Σᵢ sᵢ²`` can
     differ across DP ranks, so a single SUM all-reduce over ``dp_group`` is used
@@ -94,14 +95,17 @@ def resolve_global_flops_seqlen_stats(
             ranks share the same ``cu_seqlens`` and would double-count.
 
     Returns:
-        ``(seqlen_sum, seqlen_squared_sum, num_vision_patches)``. The first two
-        are ``None`` when no accumulation happened, signalling the caller to fall
-        back to a fixed-length estimate. ``num_vision_patches`` is ``0`` when no
-        vision tokens were seen.
+        ``(seqlen_sum, seqlen_squared_sum, num_vision_patches,
+        vision_patches_squared_sum)``. The first two are ``None`` when no
+        accumulation happened. Vision values are ``0`` when no vision tokens
+        were seen.
     """
     local_seqlen_sum = _accumulator_to_int(getattr(state, "_flops_seqlen_sum", 0))
     local_seqlen_sq_sum = _accumulator_to_int(getattr(state, "_flops_seqlen_sq_sum", 0))
     local_vision_patches = _accumulator_to_int(getattr(state, "_flops_vision_patches", 0))
+    local_vision_patches_sq_sum = _accumulator_to_int(
+        getattr(state, "_flops_vision_patches_sq_sum", 0)
+    )
     _ = vp_size
 
     use_all_reduce = (
@@ -114,21 +118,34 @@ def resolve_global_flops_seqlen_stats(
     if use_all_reduce:
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
         stats = torch.tensor(
-            [local_seqlen_sum, local_seqlen_sq_sum, local_vision_patches],
+            [
+                local_seqlen_sum,
+                local_seqlen_sq_sum,
+                local_vision_patches,
+                local_vision_patches_sq_sum,
+            ],
             dtype=torch.long,
             device=device,
         )
         torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-        seqlen_sum, seqlen_squared_sum, num_vision_patches = (int(x) for x in stats.tolist())
+        seqlen_sum, seqlen_squared_sum, num_vision_patches, vision_patches_squared_sum = (
+            int(x) for x in stats.tolist()
+        )
     else:
         # No process group: extrapolate from the local rank (approximation).
         seqlen_sum = local_seqlen_sum * data_parallel_size
         seqlen_squared_sum = local_seqlen_sq_sum * data_parallel_size
         num_vision_patches = local_vision_patches * data_parallel_size
+        vision_patches_squared_sum = local_vision_patches_sq_sum * data_parallel_size
 
     if seqlen_sum <= 0:
-        return None, None, max(num_vision_patches, 0)
-    return seqlen_sum, seqlen_squared_sum, max(num_vision_patches, 0)
+        return None, None, max(num_vision_patches, 0), max(vision_patches_squared_sum, 0)
+    return (
+        seqlen_sum,
+        seqlen_squared_sum,
+        max(num_vision_patches, 0),
+        max(vision_patches_squared_sum, 0),
+    )
 
 
 def _add_flops_accumulator(state, name: str, delta) -> None:
@@ -198,6 +215,7 @@ def accumulate_flops_metadata(
     cu_seqlens_unpadded: torch.Tensor | None = None,
     cu_seqlens_unpadded_argmin: torch.Tensor | None = None,
     num_vision_patches: int | torch.Tensor | None = None,
+    vision_patches_squared_sum: int | torch.Tensor | None = None,
 ) -> None:
     """Accumulate per-microbatch FLOPS metadata onto ``state``.
 
@@ -223,6 +241,8 @@ def accumulate_flops_metadata(
       pre-fix value). ``dense_seq_len`` is ``config_seq_len`` when provided,
       otherwise ``tokens.shape[1]``.
     - ``_flops_vision_patches``: running total of ``num_vision_patches``.
+    - ``_flops_vision_patches_sq_sum``: running total of the exact quadratic
+      ViT-attention patch term.
 
     ``num_vision_patches`` is the precomputed number of vision patches in this
     microbatch (drives the ViT term). It is kept model-agnostic on purpose: the
@@ -261,12 +281,22 @@ def accumulate_flops_metadata(
 
     if num_vision_patches is not None:
         _add_flops_accumulator(state, "_flops_vision_patches", num_vision_patches)
+        # Vision shapes may differ between pure-DP ranks even for dense text.
+        setattr(state, "_flops_requires_global_reduce", True)
+    if vision_patches_squared_sum is not None:
+        _add_flops_accumulator(
+            state,
+            "_flops_vision_patches_sq_sum",
+            vision_patches_squared_sum,
+        )
 
 
 def vit_flops(
     cfg: ConfigContainer,
     batch_size: int,
-    num_patches: int,
+    num_patches: int | float,
+    *,
+    patches_squared_sum: int | float | None = None,
 ):
     """Calculate FLOPs for a Vision Transformer (ViT) encoder + patch merger.
 
@@ -281,15 +311,15 @@ def vit_flops(
             ``out_hidden_size``). Passing the whole config keeps the public
             signature stable as the list of required ViT attributes grows.
         batch_size: Batch size.
-        num_patches: Per-image number of vision patches (before spatial
-            merge). Callers that track the total patch count across the
-            batch should divide by ``batch_size`` before invoking, because
-            ViT attention is per-image (not cross-image) and scales
-            quadratically with the per-image patch count.
+        num_patches: Average number of vision patches per sample before spatial
+            merge.
+        patches_squared_sum: Sum of squared patch counts for each independent
+            vision-attention sequence in the global batch.
 
     Returns:
-        Total training FLOPs (forward * 3 for fwd+bwd). Returns 0 when
-        no ``vision_config`` is attached or ``num_patches`` is non-positive.
+        Total executed vision FLOPs using the configured encoder/projector
+        freeze state. Returns 0 when ``vision_config`` is unavailable or the
+        patch count is non-positive.
     """
     vision_config = getattr(cfg.model, "vision_config", None)
     if vision_config is None or num_patches <= 0:
@@ -300,31 +330,40 @@ def vit_flops(
     intermediate_size = getattr(vision_config, "intermediate_size", 0)
     spatial_merge_size = getattr(vision_config, "spatial_merge_size", 2)
     out_hidden_size = getattr(vision_config, "out_hidden_size", cfg.model.hidden_size)
+    total_patches = batch_size * num_patches
+    if patches_squared_sum is None:
+        patches_squared_sum = batch_size * num_patches**2
 
     # ViT Transformer layers (bidirectional attention)
-    per_token_per_layer = (
+    linear_flops_per_patch = (
         # QKV + O projections: 4 matmuls of h x h => 4 * 2 * h^2 FMA = 8h^2
         # but standard counting: Q,K,V each h->h (3 * 2h^2) + O h->h (2h^2) = 8h^2
         8 * hidden_size**2
-        # Attention core (full bidirectional, not causal): QK^T + attn*V
-        # = 2 * 2 * h * num_patches = 4 * h * num_patches
-        + 4 * hidden_size * num_patches
         # MLP (GELU, 2 matmuls): fc1 h->intermediate + fc2 intermediate->h
         # = 2 * 2 * h * intermediate = 4 * h * intermediate
         + 4 * hidden_size * intermediate_size
     )
-    transformer_flops_val = per_token_per_layer * num_patches * depth
+    transformer_flops_val = (
+        linear_flops_per_patch * total_patches + 4 * hidden_size * patches_squared_sum
+    ) * depth
 
     # Patch Merger: spatial merge (2x2) + MLP projection
     merge_unit = spatial_merge_size**2
     merged_hidden = hidden_size * merge_unit  # concatenated hidden dim
-    num_merged_tokens = num_patches // merge_unit if merge_unit > 0 else num_patches
+    num_merged_tokens = total_patches / merge_unit if merge_unit > 0 else total_patches
     merger_flops_val = num_merged_tokens * (
         2 * merged_hidden * merged_hidden  # fc1: merged_hidden -> merged_hidden
         + 2 * merged_hidden * out_hidden_size  # fc2: merged_hidden -> out_hidden_size
     )
 
-    return (transformer_flops_val + merger_flops_val) * batch_size * 3  # 3x for training (fwd + bwd)
+    num_mergers = 1 + len(getattr(vision_config, "deepstack_visual_indexes", []) or [])
+    freeze_encoder = getattr(cfg.model, "freeze_vision_model", False)
+    freeze_projection = getattr(cfg.model, "freeze_vision_projection", False)
+    encoder_multiplier = 1 if freeze_encoder else 3
+    # Projector backward computes dInput only when the encoder is trainable and
+    # dWeight unless the projector itself is frozen.
+    merger_multiplier = 1 + int(not freeze_encoder) + int(not freeze_projection)
+    return transformer_flops_val * encoder_multiplier + merger_flops_val * num_mergers * merger_multiplier
 
 
 def num_floating_point_operations(
@@ -333,6 +372,7 @@ def num_floating_point_operations(
     seqlen_sum: int | None = None,
     seqlen_squared_sum: int | None = None,
     num_vision_patches: int = 0,
+    vision_patches_squared_sum: int = 0,
 ):
     """Return the number of floating point operations.
 
@@ -350,6 +390,8 @@ def num_floating_point_operations(
             result matches the legacy constant-length estimate.
         num_vision_patches: Total number of vision patches in the batch
             (before spatial merge). Used to compute ViT encoder FLOPS.
+        vision_patches_squared_sum: Sum of squared patch counts for independent
+            vision-attention sequences in the batch.
     """
     # Compute effective sequence length from actual values or fall back to config.
     if seqlen_sum is not None and batch_size > 0:
@@ -1082,8 +1124,13 @@ def num_floating_point_operations(
         """
         if num_vision_patches <= 0:
             return 0
-        patches_per_image = num_vision_patches / batch_size if batch_size > 0 else num_vision_patches
-        return vit_flops(cfg, batch_size, patches_per_image)
+        patches_per_sample = num_vision_patches / batch_size if batch_size > 0 else num_vision_patches
+        return vit_flops(
+            cfg,
+            batch_size,
+            patches_per_sample,
+            patches_squared_sum=vision_patches_squared_sum or None,
+        )
 
     # Main entrypoint for FLOPs calculation. Mirror MCore's hybrid detection:
     # a physical hybrid pattern is sufficient to select hybrid accounting.

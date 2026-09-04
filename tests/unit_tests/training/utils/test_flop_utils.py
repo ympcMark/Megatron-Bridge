@@ -1746,6 +1746,25 @@ class TestVitFlops:
         f2 = vit_flops(cfg, batch_size=2, num_patches=64)
         assert f2 == 2 * f1
 
+    def test_vit_flops_uses_exact_patch_square_sum_for_mixed_shapes(self):
+        cfg = self._base_cfg(depth=2, hidden_size=128, intermediate_size=256)
+        exact = vit_flops(
+            cfg,
+            batch_size=2,
+            num_patches=(32 + 96) / 2,
+            patches_squared_sum=32**2 + 96**2,
+        )
+        average_shape = vit_flops(cfg, batch_size=2, num_patches=64)
+        assert exact > average_shape
+
+    def test_vit_flops_respects_frozen_encoder_and_trainable_projector(self):
+        cfg = self._base_cfg(depth=2, hidden_size=128, intermediate_size=256)
+        unfrozen = vit_flops(cfg, batch_size=1, num_patches=64)
+        cfg.model.freeze_vision_model = True
+        cfg.model.freeze_vision_projection = False
+        frozen_encoder = vit_flops(cfg, batch_size=1, num_patches=64)
+        assert frozen_encoder < unfrozen
+
     def test_vit_flops_quadratic_in_num_patches_attention_term(self):
         """Attention core term should grow faster than linear in per-image patch count.
 
@@ -2393,7 +2412,7 @@ class TestAccumulateFlopsMetadata:
                     num_vision_patches=8,
                 )
 
-        seqlen_sum, seqlen_sq_sum, vision = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, vision, vision_sq = resolve_global_flops_seqlen_stats(
             state,
             data_parallel_size=1,
             vp_size=vp_size,
@@ -2402,6 +2421,7 @@ class TestAccumulateFlopsMetadata:
         assert seqlen_sum == num_microbatches * 128
         assert seqlen_sq_sum == num_microbatches * (32**2 + 96**2)
         assert vision == num_microbatches * 8
+        assert vision_sq == 0
 
     def test_tokens_none_is_noop(self):
         state = _State()
@@ -2416,7 +2436,18 @@ class TestAccumulateFlopsMetadata:
         tokens = torch.zeros(1, 64)
         accumulate_flops_metadata(state, tokens, num_vision_patches=32 + 8)
         assert state._flops_vision_patches == 40
-        assert not getattr(state, "_flops_requires_global_reduce", False)
+        assert state._flops_requires_global_reduce
+
+    def test_vision_patch_squares_accumulate(self):
+        state = _State()
+        tokens = torch.zeros(1, 64)
+        accumulate_flops_metadata(
+            state,
+            tokens,
+            num_vision_patches=40,
+            vision_patches_squared_sum=32**2 + 8**2,
+        )
+        assert state._flops_vision_patches_sq_sum == 32**2 + 8**2
 
     def test_num_vision_patches_tensor_accumulates_across_microbatches(self):
         # A scalar device tensor (no host sync) accumulates correctly.
@@ -2496,21 +2527,23 @@ class TestResolveGlobalFlopsSeqlenStats:
         state._flops_seqlen_sum = 1000
         state._flops_seqlen_sq_sum = 250_000
         state._flops_vision_patches = 64
-        seqlen_sum, seqlen_sq_sum, vision = resolve_global_flops_seqlen_stats(
+        state._flops_vision_patches_sq_sum = 2048
+        seqlen_sum, seqlen_sq_sum, vision, vision_sq = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=4, dp_group=None
         )
         assert seqlen_sum == 1000 * 4
         assert seqlen_sq_sum == 250_000 * 4
         assert vision == 64 * 4
+        assert vision_sq == 2048 * 4
 
     def test_dp_size_one_returns_local(self):
         state = _State()
         state._flops_seqlen_sum = 512
         state._flops_seqlen_sq_sum = 4096
-        seqlen_sum, seqlen_sq_sum, vision = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, vision, vision_sq = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=1, dp_group=None
         )
-        assert (seqlen_sum, seqlen_sq_sum, vision) == (512, 4096, 0)
+        assert (seqlen_sum, seqlen_sq_sum, vision, vision_sq) == (512, 4096, 0, 0)
 
     def test_vpp_size_does_not_rescale_before_extrapolation(self):
         # VPP accumulators already represent the executed training step; dividing
@@ -2519,29 +2552,33 @@ class TestResolveGlobalFlopsSeqlenStats:
         state._flops_seqlen_sum = 1000
         state._flops_seqlen_sq_sum = 250_000
         state._flops_vision_patches = 64
-        seqlen_sum, seqlen_sq_sum, vision = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, vision, vision_sq = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=2, vp_size=4, dp_group=None
         )
         assert seqlen_sum == 1000 * 2
         assert seqlen_sq_sum == 250_000 * 2
         assert vision == 64 * 2
+        assert vision_sq == 0
 
     def test_no_accumulation_returns_none(self):
         # Step functions that don't set accumulators → caller falls back to fixed-length.
         state = _State()
-        seqlen_sum, seqlen_sq_sum, vision = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, vision, vision_sq = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=8, dp_group=None
         )
         assert seqlen_sum is None
         assert seqlen_sq_sum is None
         assert vision == 0
+        assert vision_sq == 0
 
     def test_coerces_scalar_tensor_accumulators(self):
         # forward_step may leave accumulators as scalar tensors (deferred host sync).
         state = _State()
         state._flops_seqlen_sum = torch.tensor(800)
         state._flops_seqlen_sq_sum = torch.tensor(160_000)
-        seqlen_sum, seqlen_sq_sum, _ = resolve_global_flops_seqlen_stats(state, data_parallel_size=2, dp_group=None)
+        seqlen_sum, seqlen_sq_sum, _, _ = resolve_global_flops_seqlen_stats(
+            state, data_parallel_size=2, dp_group=None
+        )
         assert seqlen_sum == 1600
         assert seqlen_sq_sum == 320_000
 
@@ -2552,7 +2589,7 @@ class TestResolveGlobalFlopsSeqlenStats:
         state = _State()
         state._flops_seqlen_sum = 10
         state._flops_seqlen_sq_sum = 100
-        seqlen_sum, seqlen_sq_sum, _ = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, _, _ = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=4, dp_group=object()
         )
         assert seqlen_sum == 40
@@ -2570,7 +2607,7 @@ class TestResolveGlobalFlopsSeqlenStats:
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
-        seqlen_sum, seqlen_sq_sum, _ = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, _, _ = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=4, dp_group=object()
         )
 
@@ -2595,9 +2632,9 @@ class TestResolveGlobalFlopsSeqlenStats:
         monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-        seqlen_sum, seqlen_sq_sum, vision = resolve_global_flops_seqlen_stats(
+        seqlen_sum, seqlen_sq_sum, vision, vision_sq = resolve_global_flops_seqlen_stats(
             state, data_parallel_size=4, dp_group=object()
         )
 
         all_reduce.assert_called_once()
-        assert (seqlen_sum, seqlen_sq_sum, vision) == (40, 400, 0)
+        assert (seqlen_sum, seqlen_sq_sum, vision, vision_sq) == (40, 400, 0, 0)

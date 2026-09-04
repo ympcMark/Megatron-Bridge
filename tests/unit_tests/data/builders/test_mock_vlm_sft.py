@@ -15,12 +15,14 @@
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from megatron.training.config.instantiate_utils import instantiate
 
 from megatron.bridge.data import DatasetBuildContext
 from megatron.bridge.data.builders import MockVLMSFTDatasetBuilder, MockVLMSFTDatasetConfig
 from megatron.bridge.data.builders import mock_vlm_sft as builder_module
 from megatron.bridge.training.config import ConfigContainer
+from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 
 def _config(**overrides) -> MockVLMSFTDatasetConfig:
@@ -59,6 +61,63 @@ def test_mock_examples_are_deterministic_and_follow_conversation_schema():
     }
     assert first[0]["conversation"][1] == second[0]["conversation"][1]
     assert first[0]["conversation"][0]["content"][0]["image"].size == (8, 6)
+
+
+def test_ratio_controls_text_and_image_repetition():
+    config = _config(
+        seq_length=128,
+        ratio=2.0,
+        num_images=1,
+        image_size=(16, 16),
+        num_base_examples=1,
+    )
+
+    example = builder_module.make_mock_vlm_examples(config)[0]
+    user_content = example["conversation"][0]["content"]
+    response = example["conversation"][1]["content"][0]["text"]
+
+    # One 16x16 image contributes one estimated post-merge token. With ratio=2,
+    # each repeated unit has two words and three total tokens, so ceil(128/3)=43.
+    assert sum(part["type"] == "image" for part in user_content) == 43
+    assert len(response.split()) == 86
+
+
+def test_builder_loads_fully_collated_cache_without_processor(tmp_path):
+    cache_path = tmp_path / "mock.pt"
+    metadata = {
+        "seq_length": 128,
+        "micro_batch_size": 1,
+        "ratio": 2.0,
+        "image_size": [16, 16],
+        "num_images": 1,
+    }
+    torch.save(
+        {
+            "metadata": metadata,
+            "batch": {
+                "input_ids": torch.ones(1, 128, dtype=torch.long),
+                "visual_inputs": {},
+            },
+        },
+        cache_path,
+    )
+    config = _config(
+        ratio=2.0,
+        num_images=1,
+        image_size=(16, 16),
+        cache_path=str(cache_path),
+        cache_micro_batch_size=1,
+    )
+
+    train, validation, test = MockVLMSFTDatasetBuilder(config).build(
+        DatasetBuildContext(train_samples=2, valid_samples=0, test_samples=0)
+    )
+
+    assert config.dataloader_type == "external"
+    assert validation is None and test is None
+    batch = next(train)
+    assert batch["input_ids"].shape == (1, 128)
+    assert isinstance(batch["visual_inputs"], GenericVisualInputs)
 
 
 def test_builder_loads_processor_at_runtime_and_builds_requested_splits(monkeypatch: pytest.MonkeyPatch):
@@ -107,6 +166,7 @@ def test_builder_loads_processor_at_runtime_and_builds_requested_splits(monkeypa
     "overrides, error",
     [
         ({"num_images": -1}, "num_images"),
+        ({"ratio": -1.0}, "ratio"),
         ({"image_size": (0, 16)}, "image_size"),
         ({"pad_to_multiple_of": 0}, "pad_to_multiple_of"),
     ],

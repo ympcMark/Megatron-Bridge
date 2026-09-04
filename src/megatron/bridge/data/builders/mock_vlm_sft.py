@@ -14,16 +14,21 @@
 
 """Serializable config and runtime builder for synthetic VLM conversations."""
 
+import math
+from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy
+import torch
 from PIL import Image
 from transformers import AutoProcessor
 
 from megatron.bridge.data.base import DataloaderConfig, DatasetBuildContext
 from megatron.bridge.data.datasets.direct_sft import DirectSFTDataset
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
+from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 
 _MOCK_RESPONSE_VOCABULARY = (
@@ -39,6 +44,23 @@ _MOCK_RESPONSE_VOCABULARY = (
 ).split()
 
 
+class _CachedBatchIterator(Iterator[dict[str, Any]]):
+    """Repeat one fully collated CPU microbatch without rerunning preprocessing."""
+
+    def __init__(self, batch: dict[str, Any]) -> None:
+        self.batch = batch
+
+    def __iter__(self) -> "_CachedBatchIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        batch = self.batch.copy()
+        visual_inputs = batch.get("visual_inputs")
+        if isinstance(visual_inputs, dict):
+            batch["visual_inputs"] = GenericVisualInputs(**visual_inputs)
+        return batch
+
+
 @dataclass(kw_only=True)
 class MockVLMSFTDatasetConfig(DataloaderConfig):
     """Serializable settings for synthetic conversation-style VLM data."""
@@ -49,14 +71,17 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
     random_seed: int = 0
     image_size: tuple[int, int] = (256, 256)
     num_images: int = 1
+    ratio: float | None = None
     num_base_examples: int = 1000
     skip_getting_attention_mask_from_dataset: bool = True
-    dataloader_type: Literal["single", "cyclic"] | None = "single"
+    dataloader_type: Literal["single", "cyclic", "external"] | None = "single"
     enable_in_batch_packing: bool = False
     defer_in_batch_packing_to_step: bool = False
     pad_to_max_length: bool = False
     pad_to_multiple_of: int = 128
     in_batch_packing_pad_to_multiple_of: int = 1
+    cache_path: str | None = None
+    cache_micro_batch_size: int | None = None
 
     def validate(self) -> None:
         """Validate synthetic data settings."""
@@ -70,12 +95,16 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
             raise ValueError("image_size must contain two positive dimensions.")
         if self.num_images < 0:
             raise ValueError("num_images must be greater than or equal to 0.")
+        if self.ratio is not None and self.ratio < 0:
+            raise ValueError("ratio must be greater than or equal to 0 when set.")
         if self.num_base_examples <= 0:
             raise ValueError("num_base_examples must be greater than 0.")
         if self.pad_to_multiple_of <= 0:
             raise ValueError("pad_to_multiple_of must be greater than 0.")
         if self.in_batch_packing_pad_to_multiple_of <= 0:
             raise ValueError("in_batch_packing_pad_to_multiple_of must be greater than 0.")
+        if self.cache_path is not None and (self.cache_micro_batch_size is None or self.cache_micro_batch_size <= 0):
+            raise ValueError("cache_micro_batch_size must be positive when cache_path is set.")
 
     def finalize(self) -> None:
         """Finalize dataloader settings and validate this config."""
@@ -87,12 +116,15 @@ def make_mock_vlm_example(
     config: MockVLMSFTDatasetConfig,
     rng: numpy.random.Generator,
     response_text: str,
+    *,
+    num_images: int | None = None,
 ) -> dict[str, Any]:
     """Create one synthetic conversation with the configured number of images."""
     width, height = config.image_size
+    num_images = config.num_images if num_images is None else num_images
     images = [
         Image.fromarray(rng.integers(low=0, high=256, size=(height, width, 3), dtype=numpy.uint8), mode="RGB")
-        for _ in range(config.num_images)
+        for _ in range(num_images)
     ]
     content = [{"type": "image", "image": image} for image in images]
     content.append({"type": "text", "text": config.prompt})
@@ -107,12 +139,34 @@ def make_mock_vlm_example(
 def make_mock_vlm_examples(config: MockVLMSFTDatasetConfig) -> list[dict[str, Any]]:
     """Generate the deterministic base examples reused by every requested split."""
     rng = numpy.random.default_rng(seed=config.random_seed)
-    response_length_range = (10, 100) if config.enable_in_batch_packing else (10, 30)
     examples = []
+    if config.ratio is None:
+        response_length_range = (10, 100) if config.enable_in_batch_packing else (10, 30)
+        for _ in range(config.num_base_examples):
+            response_length = int(rng.integers(*response_length_range))
+            response = " ".join(rng.choice(_MOCK_RESPONSE_VOCABULARY, size=response_length))
+            examples.append(make_mock_vlm_example(config, rng, response))
+        return examples
+
+    # Qwen3-VL uses 16x16 patches and a 2x2 spatial merger. This estimate is
+    # intentionally processor-independent; the final collator remains responsible
+    # for exact resize, truncation, and padding to ``seq_length``.
+    width, height = config.image_size
+    image_tokens_per_image = max(1, math.ceil(width / 16) * math.ceil(height / 16) // 4)
+    images_per_unit = max(1, config.num_images)
+    image_tokens_per_unit = images_per_unit * image_tokens_per_image
+    words_per_unit = max(1, math.ceil(image_tokens_per_unit * config.ratio))
+    repeats = max(1, math.ceil(config.seq_length / (image_tokens_per_unit + words_per_unit)))
     for _ in range(config.num_base_examples):
-        response_length = int(rng.integers(*response_length_range))
-        response = " ".join(rng.choice(_MOCK_RESPONSE_VOCABULARY, size=response_length))
-        examples.append(make_mock_vlm_example(config, rng, response))
+        response = " ".join(rng.choice(_MOCK_RESPONSE_VOCABULARY, size=words_per_unit * repeats))
+        examples.append(
+            make_mock_vlm_example(
+                config,
+                rng,
+                response,
+                num_images=images_per_unit * repeats,
+            )
+        )
     return examples
 
 
@@ -149,8 +203,45 @@ class MockVLMSFTDatasetBuilder:
     def build(
         self,
         context: DatasetBuildContext,
-    ) -> tuple[DirectSFTDataset | None, DirectSFTDataset | None, DirectSFTDataset | None]:
+    ) -> tuple[DirectSFTDataset | _CachedBatchIterator | None, ...]:
         """Build the train, validation, and test splits requested by the schedule."""
+        if self.config.cache_path is not None:
+            payload = torch.load(Path(self.config.cache_path), map_location="cpu", weights_only=True)
+            if isinstance(payload, dict) and "batch" in payload:
+                metadata = payload.get("metadata", {})
+                batch = payload["batch"]
+            else:
+                metadata = {}
+                batch = payload
+            if not isinstance(batch, dict) or not isinstance(batch.get("input_ids"), torch.Tensor):
+                raise ValueError(f"Invalid mock VLM cache payload: {self.config.cache_path}")
+            if batch["input_ids"].shape[0] != self.config.cache_micro_batch_size:
+                raise ValueError(
+                    f"Cached batch has MBS={batch['input_ids'].shape[0]}, "
+                    f"expected {self.config.cache_micro_batch_size}"
+                )
+            expected_metadata = {
+                "seq_length": self.config.seq_length,
+                "micro_batch_size": self.config.cache_micro_batch_size,
+                "ratio": self.config.ratio,
+                "image_size": list(self.config.image_size),
+                "num_images": self.config.num_images,
+            }
+            if metadata and any(metadata.get(key) != value for key, value in expected_metadata.items()):
+                raise ValueError(
+                    f"Mock VLM cache metadata does not match config: expected {expected_metadata}, got {metadata}"
+                )
+            self.config.dataloader_type = "external"
+
+            def _cached_if_requested(size: int) -> _CachedBatchIterator | None:
+                return _CachedBatchIterator(batch) if size > 0 else None
+
+            return (
+                _cached_if_requested(context.train_samples),
+                _cached_if_requested(context.valid_samples),
+                _cached_if_requested(context.test_samples),
+            )
+
         processor = AutoProcessor.from_pretrained(
             self.config.hf_processor_path,
             trust_remote_code=is_safe_repo(

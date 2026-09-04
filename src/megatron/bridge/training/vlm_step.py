@@ -251,14 +251,23 @@ def forward_step(
     # t*h*w per image/video), so compute it here and hand a plain scalar to the
     # model-agnostic FLOPS helper. Kept as a device tensor to avoid a host sync.
     num_vision_patches = None
+    vision_patches_squared_sum = None
     if visual_inputs is not None:
         for grid in (
             getattr(visual_inputs, "image_grid_thw", None),
             getattr(visual_inputs, "video_grid_thw", None),
         ):
             if grid is not None and grid.numel() > 0:
+                grid = grid.to(dtype=torch.int64)
                 patches = grid.prod(dim=-1).sum()
+                spatial_patches = grid[:, 1:].prod(dim=-1)
+                patches_squared = (grid[:, 0] * spatial_patches.square()).sum()
                 num_vision_patches = patches if num_vision_patches is None else num_vision_patches + patches
+                vision_patches_squared_sum = (
+                    patches_squared
+                    if vision_patches_squared_sum is None
+                    else vision_patches_squared_sum + patches_squared
+                )
     cu_seqlens = None
     cu_seqlens_unpadded = None
     if packed_seq_params is not None:
@@ -273,6 +282,7 @@ def forward_step(
         cu_seqlens=cu_seqlens,
         cu_seqlens_unpadded=cu_seqlens_unpadded,
         num_vision_patches=num_vision_patches,
+        vision_patches_squared_sum=vision_patches_squared_sum,
     )
 
     forward_args = {
