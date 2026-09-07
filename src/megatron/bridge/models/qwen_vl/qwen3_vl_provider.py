@@ -119,6 +119,13 @@ class Qwen3VLModelProvider(GPTModelProvider):
     use_hf_vision_model: bool = False
 
     vision_dp_when_cp: bool = False
+    vision_dp_over_tp_cp: bool = False
+    vision_apply_qk_absolute_rope_fusion: bool = True
+    torch_compile_vision_encoder: bool = False
+    torch_compile_vision_encoder_mode: str = "default"
+    torch_compile_vision_encoder_dynamic: bool = True
+    vision_bias_activation_fusion: bool = False
+    vision_bias_dropout_fusion: bool = False
 
     # It’s an experimental feature and may change in the future.
     dist_train: DistTrainConfig = field(default_factory=DistTrainConfig)
@@ -135,6 +142,11 @@ class Qwen3VLModelProvider(GPTModelProvider):
     max_vision_cuda_graph_seq_length: Optional[int] = None
 
     def finalize(self) -> None:
+        if self.vision_dp_over_tp_cp:
+            if not self.freeze_vision_model or self.freeze_vision_projection:
+                raise ValueError("vision_dp_over_tp_cp requires a frozen ViT and trainable vision projection")
+            if not self.vision_dp_when_cp:
+                raise ValueError("vision_dp_over_tp_cp requires vision_dp_when_cp=True")
         if (self.context_parallel_size or 1) > 1:
             self.calculate_per_token_loss = True
         super().finalize()
@@ -285,6 +297,13 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
 
     use_hf_vision_model: bool = False
     vision_dp_when_cp: bool = False
+    vision_dp_over_tp_cp: bool = False
+    vision_apply_qk_absolute_rope_fusion: bool = True
+    torch_compile_vision_encoder: bool = False
+    torch_compile_vision_encoder_mode: str = "default"
+    torch_compile_vision_encoder_dynamic: bool = True
+    vision_bias_activation_fusion: bool = False
+    vision_bias_dropout_fusion: bool = False
 
     # It’s an experimental feature and may change in the future.
     dist_train: DistTrainConfig = field(default_factory=DistTrainConfig)
@@ -300,6 +319,11 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
     max_vision_cuda_graph_seq_length: Optional[int] = None
 
     def finalize(self) -> None:
+        if self.vision_dp_over_tp_cp:
+            if not self.freeze_vision_model or self.freeze_vision_projection:
+                raise ValueError("vision_dp_over_tp_cp requires a frozen ViT and trainable vision projection")
+            if not self.vision_dp_when_cp:
+                raise ValueError("vision_dp_over_tp_cp requires vision_dp_when_cp=True")
         if (self.context_parallel_size or 1) > 1:
             self.calculate_per_token_loss = True
         if self.tensor_model_parallel_size > 1:

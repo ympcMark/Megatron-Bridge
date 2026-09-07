@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+from dataclasses import fields
 from typing import Optional
 
 import torch
@@ -51,6 +53,24 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
 )
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
 from megatron.bridge.training.utils.packed_seq_utils import get_packed_seq_cp_partition_indices
+
+
+def _build_vision_encoder_pg_collection(
+    pg_collection: ProcessGroupCollection,
+) -> ProcessGroupCollection:
+    """Clone process groups and replace TP/CP with the per-rank vision group."""
+    if not hasattr(pg_collection, "vision_tp"):
+        raise RuntimeError("vision_dp_over_tp_cp requires the singleton vision_tp process group")
+    kwargs = {
+        field.name: getattr(pg_collection, field.name)
+        for field in fields(ProcessGroupCollection)
+        if hasattr(pg_collection, field.name)
+    }
+    singleton_group = pg_collection.vision_tp
+    kwargs["tp"] = singleton_group
+    kwargs["cp"] = singleton_group
+    kwargs["tp_cp"] = singleton_group
+    return ProcessGroupCollection(**kwargs)
 
 
 def _is_mrope_position_ids(position_ids: torch.Tensor | None) -> bool:
@@ -151,6 +171,9 @@ class Qwen3VLModel(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
+        self.vision_dp_over_tp_cp = bool(
+            getattr(language_transformer_config, "vision_dp_over_tp_cp", False)
+        )
         assert hasattr(self.pg_collection, "embd"), (
             "pg_collection must have a embd. In previous version, it used default "
             "`parallel_state.default_embedding_ranks` to create the process group."
@@ -188,11 +211,20 @@ class Qwen3VLModel(MegatronModule):
             )
 
             vision_transformer_layer_spec.submodules.self_attention.module = Qwen3VLSelfAttention
-            megatron_vision_transformer_config = get_vision_model_config(
+            projector_vision_transformer_config = get_vision_model_config(
                 vision_transformer_config, megatron_config=language_transformer_config
             )
-            megatron_vision_transformer_config.pipeline_model_parallel_size = 1
-            megatron_vision_transformer_config.first_pipeline_num_layers = None
+            projector_vision_transformer_config.pipeline_model_parallel_size = 1
+            projector_vision_transformer_config.first_pipeline_num_layers = None
+
+            if self.vision_dp_over_tp_cp:
+                megatron_vision_transformer_config = deepcopy(projector_vision_transformer_config)
+                megatron_vision_transformer_config.tensor_model_parallel_size = 1
+                megatron_vision_transformer_config.sequence_parallel = False
+                vision_encoder_pg_collection = _build_vision_encoder_pg_collection(pg_collection)
+            else:
+                megatron_vision_transformer_config = projector_vision_transformer_config
+                vision_encoder_pg_collection = pg_collection
 
             self.vision_model = Qwen3VLVisionModel(
                 megatron_vision_transformer_config,
@@ -200,7 +232,10 @@ class Qwen3VLModel(MegatronModule):
                 vision_patch_merger_spec,
                 pre_process=True,
                 post_process=True,
-                pg_collection=pg_collection,
+                pg_collection=vision_encoder_pg_collection,
+                projector_config=projector_vision_transformer_config,
+                projector_tp_group=pg_collection.tp,
+                vision_dp_over_tp_cp=self.vision_dp_over_tp_cp,
             )
         if self.add_decoder:
             self.language_model = Qwen3VLGPTModel(
@@ -425,6 +460,8 @@ class Qwen3VLModel(MegatronModule):
 
         cp_rank = self.pg_collection.cp.rank()
         cp_size = self.pg_collection.cp.size()
+        tp_rank = self.pg_collection.tp.rank()
+        tp_size = self.pg_collection.tp.size()
         legacy_packed_bshd = (
             packed_seq_params is not None and input_ids is not None and input_ids.dim() == 2 and input_ids.size(0) > 1
         )
@@ -468,23 +505,49 @@ class Qwen3VLModel(MegatronModule):
             vision_embeds = None
 
             if vision_grid_thw is not None and vision_grid_thw.shape[0] > 0:
-                if cp_size > 1 and self.config.vision_dp_when_cp:
+                use_tp_cp_vision_dp = (
+                    self.vision_dp_over_tp_cp
+                    and vision_grid_thw.shape[0] >= cp_size * tp_size
+                )
+                vision_dp_size = cp_size * tp_size if use_tp_cp_vision_dp else cp_size
+                vision_dp_rank = cp_rank * tp_size + tp_rank if use_tp_cp_vision_dp else cp_rank
+                use_vision_data_parallel = self.config.vision_dp_when_cp and vision_dp_size > 1
+                vision_tp_gather_seqlens = None
+                seqlen_on_cp_ranks = None
+                if use_vision_data_parallel:
                     if cp_img_num is None:
                         assert images_padded is None
                         vision_data, vision_grid_thw, cp_img_num, images_padded = qwen3vl_cp_split(
-                            cp_size,
+                            vision_dp_size,
                             vision_data,
                             vision_grid_thw,
                         )
-                    vision_data, vision_grid_thw, seqlen_on_cp_ranks = get_vision_cp_data(
+                    elif use_tp_cp_vision_dp:
+                        raise ValueError(
+                            "precomputed cp_img_num is incompatible with vision_dp_over_tp_cp"
+                        )
+                    vision_data, vision_grid_thw, seqlen_on_vision_ranks = get_vision_cp_data(
                         vision_data,
                         vision_grid_thw,
                         self.square_merge_size,
                         cp_img_num,
                         images_padded,
-                        cp_rank,
-                        cp_size,
+                        vision_dp_rank,
+                        vision_dp_size,
                     )
+                    if use_tp_cp_vision_dp:
+                        tp_begin = cp_rank * tp_size
+                        tp_end = tp_begin + tp_size
+                        vision_tp_gather_seqlens = [
+                            seqlens * self.square_merge_size
+                            for seqlens in seqlen_on_vision_ranks[tp_begin:tp_end]
+                        ]
+                        seqlen_on_cp_ranks = [
+                            torch.cat(seqlen_on_vision_ranks[rank * tp_size : (rank + 1) * tp_size], dim=0)
+                            for rank in range(cp_size)
+                        ]
+                    else:
+                        seqlen_on_cp_ranks = seqlen_on_vision_ranks
                     vision_grid_thw = collapse_thw(vision_grid_thw)
                 if vision_data.shape[0] > 0:
                     if self.use_dist_train:
@@ -498,6 +561,7 @@ class Qwen3VLModel(MegatronModule):
                             vision_embeds, deepstack_feature_lists = self.vision_model(
                                 hidden_states=vision_data,
                                 grid_thw=vision_grid_thw,
+                                vision_tp_gather_seqlens=vision_tp_gather_seqlens,
                             )
                             output_vision_module = pack_dist_train_vision_module_output(
                                 vision_embeds,
@@ -512,6 +576,7 @@ class Qwen3VLModel(MegatronModule):
                         vision_embeds, deepstack_feature_lists = self.vision_model(
                             hidden_states=vision_data,
                             grid_thw=vision_grid_thw,
+                            vision_tp_gather_seqlens=vision_tp_gather_seqlens,
                         )
                 else:
                     vision_embeds = torch.zeros(
@@ -528,7 +593,7 @@ class Qwen3VLModel(MegatronModule):
                                 dtype=torch.bfloat16,
                             )
                         )
-                if cp_size > 1 and self.config.vision_dp_when_cp:
+                if cp_size > 1 and use_vision_data_parallel:
                     vision_embeds = AllGatherVisionEmbeddings.apply(
                         vision_embeds,
                         seqlen_on_cp_ranks,

@@ -20,6 +20,7 @@ import torch.nn as nn
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     _apply_rotary_pos_emb_bshd,
+    fused_apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -464,28 +465,26 @@ def apply_rotary_pos_emb_absolute(
 
     In Qwen3-VL, the shape of freqs is (seq_length, bs, 1, 2 * dim) instead of [max_seqlen, 1, 1, 2 * dim]
     """
-    # Fused RoPE (TE kernels) is not supported for Qwen3-VL / Qwen3.5-VL because:
-    # 1. This function uses per-token absolute freqs with shape (seq_len, bs, 1, 2*dim),
-    #    which differs from the standard mcore format (max_seqlen, 1, 1, 2*dim).
-    #    TE's fused_apply_rotary_pos_emb / fused_apply_rotary_pos_emb_thd expect the
-    #    standard format and would produce incorrect results with absolute freqs.
-    # 2. Qwen3VLSelfAttention calls this function directly, bypassing the mcore
-    #    apply_rotary_pos_emb() dispatcher that routes to fused kernels.
-    # 3. validate_rope_fusion_compatibility() already blocks fusion for mrope models
-    #    (position_embedding_type='mrope'), so provide() resets the flag to False.
-    #    This assert is a safety net in case the flag is forced on after provide().
-    assert not config.apply_rope_fusion, (
-        "apply_rope_fusion is not supported for Qwen3-VL / Qwen3.5-VL models. "
-        "This code path uses per-token absolute positional frequencies that are incompatible "
-        "with TE's fused RoPE kernels. Setting apply_rope_fusion=True would not actually "
-        "enable fusion (Qwen3VLSelfAttention bypasses the fused dispatch), but the flag "
-        "must remain False to avoid misleading configuration state."
-    )
     orig_t_dtype = t.dtype
     if config.apply_rotary_pos_emb_in_fp32:
         t = t.float()
 
-    if cu_seqlens is None:
+    # TE's BSHD kernel supports Qwen3-VL absolute frequencies when the batch
+    # dimension is one. Keep the established implementation for packed THD or
+    # multi-batch inputs; those layouts do not share this kernel contract.
+    use_fused = (
+        config.apply_rope_fusion
+        and cu_seqlens is None
+        and freqs.shape[1] == 1
+        and fused_apply_rotary_pos_emb is not None
+    )
+    if use_fused:
+        result = fused_apply_rotary_pos_emb(
+            t,
+            freqs,
+            interleaved=config.rotary_interleaved,
+        )
+    elif cu_seqlens is None:
         result = _apply_rotary_pos_emb_bshd(t, freqs, rotary_interleaved=config.rotary_interleaved)
     else:
         result = apply_rotary_pos_emb_thd_absolute(t, cu_seqlens, freqs, rotary_interleaved=config.rotary_interleaved)
@@ -494,3 +493,141 @@ def apply_rotary_pos_emb_absolute(
         result = result.to(orig_t_dtype)
 
     return result
+
+
+def _rotate_half_absolute(t: Tensor, rotary_interleaved: bool) -> Tensor:
+    """Rotate the last dimension using the same convention as the reference path."""
+    if rotary_interleaved:
+        t_even = t[..., 0::2]
+        t_odd = t[..., 1::2]
+        return torch.stack((-t_odd, t_even), dim=-1).flatten(-2)
+
+    t_first, t_second = torch.chunk(t, 2, dim=-1)
+    return torch.cat((-t_second, t_first), dim=-1)
+
+
+def _apply_qk_rotary_pos_emb_absolute_impl(
+    query: Tensor,
+    key: Tensor,
+    freqs: Tensor,
+    rotary_interleaved: bool,
+) -> tuple[Tensor, Tensor]:
+    """Apply shared absolute-frequency RoPE to packed Q and K."""
+    query_dtype = query.dtype
+    key_dtype = key.dtype
+    rotary_dim = freqs.shape[-1]
+
+    query_bshd = query.unsqueeze(1)
+    key_bshd = key.unsqueeze(1)
+    query_rot = query_bshd[..., :rotary_dim].float()
+    key_rot = key_bshd[..., :rotary_dim].float()
+    freqs_fp32 = freqs.float()
+    cos = torch.cos(freqs_fp32)
+    sin = torch.sin(freqs_fp32)
+
+    query_out = query_rot * cos + _rotate_half_absolute(query_rot, rotary_interleaved) * sin
+    key_out = key_rot * cos + _rotate_half_absolute(key_rot, rotary_interleaved) * sin
+    if rotary_dim < query_bshd.shape[-1]:
+        query_out = torch.cat((query_out, query_bshd[..., rotary_dim:].float()), dim=-1)
+    if rotary_dim < key_bshd.shape[-1]:
+        key_out = torch.cat((key_out, key_bshd[..., rotary_dim:].float()), dim=-1)
+
+    return (
+        query_out.squeeze(1).to(query_dtype).contiguous(),
+        key_out.squeeze(1).to(key_dtype).contiguous(),
+    )
+
+
+def _split_qkv_apply_qk_rotary_pos_emb_absolute_impl(
+    mixed_qkv: Tensor,
+    freqs: Tensor,
+    num_query_groups_per_partition: int,
+    hidden_size_per_attention_head: int,
+    rotary_interleaved: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Split ViT QKV and apply shared absolute RoPE in one compiled graph."""
+    qkv_shape = mixed_qkv.shape[:-1] + (
+        num_query_groups_per_partition,
+        3 * hidden_size_per_attention_head,
+    )
+    mixed_qkv = mixed_qkv.view(qkv_shape)
+    query, key, value = torch.split(mixed_qkv, hidden_size_per_attention_head, dim=-1)
+
+    query_dtype = query.dtype
+    key_dtype = key.dtype
+    rotary_dim = freqs.shape[-1]
+    query_rot = query[..., :rotary_dim].float()
+    key_rot = key[..., :rotary_dim].float()
+    freqs_fp32 = freqs.float()
+    cos = torch.cos(freqs_fp32)
+    sin = torch.sin(freqs_fp32)
+
+    query_out = query_rot * cos + _rotate_half_absolute(query_rot, rotary_interleaved) * sin
+    key_out = key_rot * cos + _rotate_half_absolute(key_rot, rotary_interleaved) * sin
+    if rotary_dim < query.shape[-1]:
+        query_out = torch.cat((query_out, query[..., rotary_dim:].float()), dim=-1)
+    if rotary_dim < key.shape[-1]:
+        key_out = torch.cat((key_out, key[..., rotary_dim:].float()), dim=-1)
+
+    return (
+        query_out.to(query_dtype).contiguous(),
+        key_out.to(key_dtype).contiguous(),
+        value,
+    )
+
+
+_apply_qk_rotary_pos_emb_absolute_compiled = torch.compile(
+    _apply_qk_rotary_pos_emb_absolute_impl,
+    fullgraph=True,
+    dynamic=True,
+)
+_split_qkv_apply_qk_rotary_pos_emb_absolute_compiled = torch.compile(
+    _split_qkv_apply_qk_rotary_pos_emb_absolute_impl,
+    fullgraph=True,
+    dynamic=True,
+)
+_split_qkv_apply_qk_rotary_pos_emb_absolute_compiled_cache = {
+    ("default", True): _split_qkv_apply_qk_rotary_pos_emb_absolute_compiled,
+}
+
+
+def apply_qk_rotary_pos_emb_absolute(
+    query: Tensor,
+    key: Tensor,
+    freqs: Tensor,
+    config: Qwen3VLTransformerConfig,
+) -> tuple[Tensor, Tensor]:
+    """Apply packed absolute RoPE to Q and K in one compiled graph."""
+    return _apply_qk_rotary_pos_emb_absolute_compiled(
+        query, key, freqs, config.rotary_interleaved
+    )
+
+
+def split_qkv_apply_qk_rotary_pos_emb_absolute(
+    mixed_qkv: Tensor,
+    freqs: Tensor,
+    num_query_groups_per_partition: int,
+    hidden_size_per_attention_head: int,
+    config: Qwen3VLTransformerConfig,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compiled ViT QKV post-processing and combined absolute RoPE island."""
+    compile_key = (
+        config.torch_compile_vision_encoder_mode,
+        config.torch_compile_vision_encoder_dynamic,
+    )
+    compiled = _split_qkv_apply_qk_rotary_pos_emb_absolute_compiled_cache.get(compile_key)
+    if compiled is None:
+        compiled = torch.compile(
+            _split_qkv_apply_qk_rotary_pos_emb_absolute_impl,
+            fullgraph=True,
+            dynamic=config.torch_compile_vision_encoder_dynamic,
+            mode=config.torch_compile_vision_encoder_mode,
+        )
+        _split_qkv_apply_qk_rotary_pos_emb_absolute_compiled_cache[compile_key] = compiled
+    return compiled(
+        mixed_qkv,
+        freqs,
+        num_query_groups_per_partition,
+        hidden_size_per_attention_head,
+        config.rotary_interleaved,
+    )

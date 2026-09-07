@@ -28,6 +28,7 @@ from torch.nn import functional as F
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import Qwen3VLVisionTransformerBlock
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
+    AllGatherVisionEmbeddings,
     Qwen3VLVisionPatchEmbed,
     Qwen3VLVisionPatchMerger,
     Qwen3VLVisionRotaryEmbedding,
@@ -126,16 +127,23 @@ class Qwen3VLVisionModel(VisionModule):
         pre_process: bool = True,
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        projector_config: Optional[Qwen3VLTransformerConfig] = None,
+        projector_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        vision_dp_over_tp_cp: bool = False,
     ) -> None:
         assert post_process and pre_process, "not support pp for deepstack_merger_list"
         super().__init__(config=transformer_config)
         self.spatial_merge_size = transformer_config.spatial_merge_size
         self.patch_size = transformer_config.patch_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
-        self.pg_collection = pg_collection
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
         self.tp_group = self.pg_collection.tp
+        self.projector_config = projector_config or transformer_config
+        self.projector_tp_group = projector_tp_group or self.tp_group
+        self.vision_dp_over_tp_cp = vision_dp_over_tp_cp
+        self._vision_encoder_weights_synced = not vision_dp_over_tp_cp
 
         assert transformer_config.context_parallel_size == 1, (
             f"context_parallel_size should be 1 in vision model but got {transformer_config.context_parallel_size}"
@@ -161,18 +169,37 @@ class Qwen3VLVisionModel(VisionModule):
             post_layer_norm=False,
             patch_merger_spec=patch_merger_spec,
             pg_collection=self.pg_collection,
+            patch_merger_config=self.projector_config,
+            patch_merger_tp_group=self.projector_tp_group,
+            gather_frozen_encoder_features=vision_dp_over_tp_cp,
         )
 
         self.merger = None
         if self.post_process:
             self.merger = Qwen3VLVisionPatchMerger(
-                transformer_config,
+                self.projector_config,
                 patch_merger_spec,
                 use_postshuffle_norm=False,
-                tp_group=self.tp_group,
+                tp_group=self.projector_tp_group,
             )
 
         self.input_tensor = None
+
+    def _synchronize_replicated_encoder_weights(self) -> None:
+        """Make TP=1 frozen encoder replicas identical within each LLM TP group."""
+        if self._vision_encoder_weights_synced:
+            return
+        source_rank = torch.distributed.get_global_rank(self.projector_tp_group, 0)
+        encoder_modules = [self.patch_embed, self.pos_embed, self.decoder.layers]
+        if self.decoder.final_layernorm is not None:
+            encoder_modules.append(self.decoder.final_layernorm)
+        with torch.no_grad():
+            for module in encoder_modules:
+                for parameter in module.parameters():
+                    if parameter.is_meta:
+                        raise RuntimeError("ViT encoder parameters are still on meta device at first forward")
+                    torch.distributed.broadcast(parameter, src=source_rank, group=self.projector_tp_group)
+        self._vision_encoder_weights_synced = True
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
@@ -308,6 +335,7 @@ class Qwen3VLVisionModel(VisionModule):
         grid_thw: torch.Tensor,
         inference_params: Optional[InferenceParams] = None,
         extra_block_kwargs: dict = None,
+        vision_tp_gather_seqlens: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Forward function of the Qwen3 Vision Model. This function passes the input tensors
         through the embedding layer and then the transformer.
@@ -323,6 +351,8 @@ class Qwen3VLVisionModel(VisionModule):
         assert grid_thw is not None
         assert self.input_tensor is None
         assert inference_params is None
+
+        self._synchronize_replicated_encoder_weights()
 
         hidden_states = self.patch_embed(hidden_states)
 
@@ -357,6 +387,7 @@ class Qwen3VLVisionModel(VisionModule):
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
+            vision_tp_gather_seqlens=vision_tp_gather_seqlens,
             **(extra_block_kwargs or {}),
         )
         # Remove padding if we added it
@@ -366,12 +397,19 @@ class Qwen3VLVisionModel(VisionModule):
             # So their length is seq_len // (spatial_merge_size^2)
             original_merged_seq_len = original_seq_len // (self.spatial_merge_size**2)
             deepstack_feature_lists = [feat[:original_merged_seq_len] for feat in deepstack_feature_lists]
+        if vision_tp_gather_seqlens is not None:
+            hidden_states = AllGatherVisionEmbeddings.apply(
+                hidden_states.detach(),
+                vision_tp_gather_seqlens,
+                self.projector_tp_group,
+            )
         hidden_states = self.merger(hidden_states)
 
         # Encodes images into continuous embeddings that can be forwarded to the language model.
-        split_sizes = (grid_thw.prod(-1) // self.spatial_merge_size**2).tolist()
-        hidden_states = torch.split(hidden_states, split_sizes)
-        hidden_states = torch.cat(hidden_states, dim=0)
+        if vision_tp_gather_seqlens is None:
+            split_sizes = (grid_thw.prod(-1) // self.spatial_merge_size**2).tolist()
+            hidden_states = torch.split(hidden_states, split_sizes)
+            hidden_states = torch.cat(hidden_states, dim=0)
         return hidden_states, deepstack_feature_lists
 
     def build_packed_seq_params(
@@ -383,7 +421,10 @@ class Qwen3VLVisionModel(VisionModule):
         cu_seqlens = seqlens.cumsum(dim=0)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0).int()
 
-        max_seqlen_q = seqlens.max()
+        # Packed sequence metadata is shared by all vision layers. Materialize
+        # this scalar once here instead of letting every attention wrapper
+        # repeat a CUDA scalar comparison/conversion.
+        max_seqlen_q = int(seqlens.max().item())
         return PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,

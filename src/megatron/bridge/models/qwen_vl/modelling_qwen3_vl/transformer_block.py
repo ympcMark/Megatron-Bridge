@@ -38,7 +38,10 @@ from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_
 from torch import Tensor, nn
 
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import Qwen3VLTransformerConfig
-from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import Qwen3VLVisionPatchMerger
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
+    AllGatherVisionEmbeddings,
+    Qwen3VLVisionPatchMerger,
+)
 
 
 try:
@@ -68,6 +71,9 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
         vp_stage: Optional[int] = None,
         patch_merger_spec: ModuleSpec = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        patch_merger_config: Optional[Qwen3VLTransformerConfig] = None,
+        patch_merger_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gather_frozen_encoder_features: bool = False,
     ):
         assert post_process and pre_process, "not support pp for deepstack_merger_list"
         super().__init__(
@@ -85,19 +91,40 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
+        self.patch_merger_config = patch_merger_config or config
+        self.patch_merger_tp_group = patch_merger_tp_group or self.tp_group
+        self.gather_frozen_encoder_features = gather_frozen_encoder_features
 
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
         self.deepstack_merger_list = nn.ModuleList(
             [
                 Qwen3VLVisionPatchMerger(
-                    config,
+                    self.patch_merger_config,
                     patch_merger_spec,
                     use_postshuffle_norm=True,
-                    tp_group=self.tp_group,
+                    tp_group=self.patch_merger_tp_group,
                 )
                 for _ in range(len(config.deepstack_visual_indexes))
             ]
         )
+
+    def _project_deepstack_feature(
+        self,
+        hidden_states: Tensor,
+        deepstack_idx: int,
+        vision_tp_gather_seqlens: Optional[list[Tensor]],
+    ) -> Tensor:
+        """Gather frozen TP-independent encoder output before the TP projector."""
+        projector_input = hidden_states
+        if self.gather_frozen_encoder_features:
+            projector_input = projector_input.detach()
+            if vision_tp_gather_seqlens is not None:
+                projector_input = AllGatherVisionEmbeddings.apply(
+                    projector_input,
+                    vision_tp_gather_seqlens,
+                    self.patch_merger_tp_group,
+                )
+        return self.deepstack_merger_list[deepstack_idx](projector_input)
 
     def _checkpointed_forward(
         self,
@@ -109,6 +136,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_fp8_context: bool,
+        vision_tp_gather_seqlens: Optional[list[Tensor]],
     ):
         """Forward method with activation checkpointing."""
 
@@ -149,7 +177,11 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                         l_no = layer.layer_number - 1
                         if l_no in self.deepstack_visual_indexes:
                             deepstack_idx = self.deepstack_visual_indexes.index(l_no)
-                            deepstack_feature = self.deepstack_merger_list[deepstack_idx](hidden_states)
+                            deepstack_feature = self._project_deepstack_feature(
+                                hidden_states,
+                                deepstack_idx,
+                                vision_tp_gather_seqlens,
+                            )
                             deepstack_feature_lists.append(deepstack_feature)
                 return hidden_states, deepstack_feature_lists, context
 
@@ -243,6 +275,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
         sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        vision_tp_gather_seqlens: Optional[list[Tensor]] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -326,6 +359,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
+                    vision_tp_gather_seqlens=vision_tp_gather_seqlens,
                 )
             else:
                 deepstack_feature_lists = []
@@ -365,7 +399,11 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
 
                         if l_no in self.deepstack_visual_indexes:
                             deepstack_idx = self.deepstack_visual_indexes.index(l_no)
-                            deepstack_feature = self.deepstack_merger_list[deepstack_idx](hidden_states)
+                            deepstack_feature = self._project_deepstack_feature(
+                                hidden_states,
+                                deepstack_idx,
+                                vision_tp_gather_seqlens,
+                            )
                             deepstack_feature_lists.append(deepstack_feature)
 
                     if (

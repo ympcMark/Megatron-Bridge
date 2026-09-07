@@ -26,9 +26,14 @@ from megatron.core.transformer.attention import (
     nvtx_range_push,
 )
 from megatron.core.transformer.dot_product_attention import DotProductAttention
+from megatron.core.typed_torch import apply_module
 from torch import Tensor
 
-from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import apply_rotary_pos_emb_absolute
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import (
+    apply_qk_rotary_pos_emb_absolute,
+    apply_rotary_pos_emb_absolute,
+    split_qkv_apply_qk_rotary_pos_emb_absolute,
+)
 
 
 class Qwen3VLSelfAttention(SelfAttention):
@@ -125,7 +130,30 @@ class Qwen3VLSelfAttention(SelfAttention):
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
         gate = None
-        if self.config.attention_output_gate:
+        use_compiled_vision_encoder = (
+            getattr(self.config, "torch_compile_vision_encoder", False)
+            and getattr(self.config, "apply_qk_absolute_rope_fusion", False)
+            and packed_seq_params is not None
+            and inference_context is None
+            and rotary_pos_emb is not None
+            and rotary_pos_emb[0] is rotary_pos_emb[1]
+            and not self.config.attention_output_gate
+            and self.q_layernorm is None
+            and self.k_layernorm is None
+            and self.num_attention_heads_per_partition == self.num_query_groups_per_partition
+            and self.config.num_query_groups >= self.world_size
+        )
+        if use_compiled_vision_encoder:
+            mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+            query, key, value = split_qkv_apply_qk_rotary_pos_emb_absolute(
+                mixed_qkv,
+                rotary_pos_emb[0],
+                self.num_query_groups_per_partition,
+                self.hidden_size_per_attention_head,
+                config=self.config,
+            )
+            rotary_pos_emb = None
+        elif self.config.attention_output_gate:
             query, key, value, gate = self.get_query_key_value_tensors(
                 hidden_states, key_value_states, output_gate=True
             )
@@ -203,7 +231,22 @@ class Qwen3VLSelfAttention(SelfAttention):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
-            if q_pos_emb is not None:
+            use_combined_absolute_rope = (
+                getattr(self.config, "apply_qk_absolute_rope_fusion", False)
+                and (inference_context is None or inference_context.is_static_batching())
+                and q_pos_emb is not None
+                and k_pos_emb is q_pos_emb
+                and query.ndim == 3
+                and key.ndim == 3
+            )
+            if use_combined_absolute_rope:
+                query, key = apply_qk_rotary_pos_emb_absolute(
+                    query,
+                    key,
+                    q_pos_emb,
+                    config=self.config,
+                )
+            elif q_pos_emb is not None:
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
                     query = apply_rotary_pos_emb_absolute(
@@ -220,7 +263,7 @@ class Qwen3VLSelfAttention(SelfAttention):
                         cu_seqlens_q,
                         self.model_comm_pgs.cp,
                     )
-            if k_pos_emb is not None:
+            if k_pos_emb is not None and not use_combined_absolute_rope:
                 key = apply_rotary_pos_emb_absolute(
                     key,
                     k_pos_emb,

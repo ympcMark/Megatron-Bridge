@@ -47,12 +47,20 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     # Multimodal rope section for [temporal, height, width] dimensions
     mrope_section: List[int] = field(default_factory=lambda: [24, 20, 20])
     apply_rope_fusion: bool = False
+    # Qwen-VL vision uses packed per-token absolute frequencies, which are not
+    # supported by TE's generic RoPE fusion. Fuse Q/K absolute RoPE separately.
+    apply_qk_absolute_rope_fusion: bool = False
+    vision_apply_qk_absolute_rope_fusion: bool = True
+    torch_compile_vision_encoder: bool = False
+    torch_compile_vision_encoder_mode: str = "default"
+    torch_compile_vision_encoder_dynamic: bool = True
 
     image_token_id: int = 151655
     video_token_id: int = 151656
     vision_start_token_id: int = 151652
     hf_text_config: Optional[Qwen3VLTextConfig] = None
     vision_dp_when_cp: bool = False
+    vision_dp_over_tp_cp: bool = False
     use_hf_vision_model: bool = False
     # Maximum sequence length for vision encoder CUDA graphs.
     max_vision_cuda_graph_seq_length: Optional[int] = None
@@ -107,14 +115,27 @@ def get_vision_model_config(hf_config, megatron_config=None):
     config.deepstack_visual_indexes = deepcopy(getattr(hf_config, "deepstack_visual_indexes", []))
 
     config.apply_rope_fusion = False
+    config.apply_qk_absolute_rope_fusion = megatron_config.vision_apply_qk_absolute_rope_fusion
+    config.torch_compile_vision_encoder = megatron_config.torch_compile_vision_encoder
+    config.torch_compile_vision_encoder_mode = megatron_config.torch_compile_vision_encoder_mode
+    config.torch_compile_vision_encoder_dynamic = megatron_config.torch_compile_vision_encoder_dynamic
     config.gated_linear_unit = False  # no gated
-    config.activation_func = partial(F.gelu, approximate="tanh")  # hidden_act
+    config.bias_activation_fusion = bool(
+        getattr(megatron_config, "vision_bias_activation_fusion", False)
+    )
+    config.bias_dropout_fusion = bool(
+        getattr(megatron_config, "vision_bias_dropout_fusion", False)
+    )
+    if config.bias_activation_fusion:
+        # MCore's bias_gelu_impl is the same tanh-approximate GELU used by Qwen3-VL.
+        config.activation_func = F.gelu
+        config.use_te_activation_func = False
+    else:
+        config.activation_func = partial(F.gelu, approximate="tanh")
     config.kv_channels = config.hidden_size // config.num_attention_heads
     config.num_query_groups = config.num_attention_heads  # no GQA
     config.layernorm_zero_centered_gamma = False  # False
     config.apply_query_key_layer_scaling = False  # factor=math.sqrt(head_dim)
-    config.bias_activation_fusion = False  # no swiglu, set false
-    config.bias_dropout_fusion = False  # no dropout, set false
     config.attention_softmax_in_fp32 = True  # use True
     config.normalization = "LayerNorm"
 

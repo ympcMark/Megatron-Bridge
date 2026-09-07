@@ -558,6 +558,25 @@ def _create_pg_collection(
     return pg_collection
 
 
+def _attach_vision_singleton_tp_group(
+    pg_collection: ProcessGroupCollection,
+    model_config: TransformerConfig,
+) -> ProcessGroupCollection:
+    """Attach a size-one TP group for a replicated frozen vision encoder."""
+    if not getattr(model_config, "vision_dp_over_tp_cp", False):
+        return pg_collection
+    if getattr(getattr(model_config, "dist_train", None), "use_dist_train", False):
+        raise ValueError("vision_dp_over_tp_cp is not supported with dist_train")
+    if pg_collection.tp.size() == 1:
+        pg_collection.vision_tp = pg_collection.tp
+        return pg_collection
+
+    singleton_ranks = [[rank] for rank in range(torch.distributed.get_world_size())]
+    vision_tp, _ = torch.distributed.new_subgroups_by_enumeration(singleton_ranks, backend="nccl")
+    pg_collection.vision_tp = vision_tp
+    return pg_collection
+
+
 def _create_dist_train_pgs(
     model_config: TransformerConfig,
     num_distributed_optimizer_instances: int,
@@ -786,7 +805,7 @@ def _initialize_distributed(
             cp = int(model_config.context_parallel_size) if getattr(model_config, "context_parallel_size", 1) else 1
             dp = torch.distributed.get_world_size() // (tp * pp * cp)
             print(f"> initialized HyperCommGrid with tp={tp}, pp={pp}, cp={cp}, dp={dp}")
-        return pg_collection
+        return _attach_vision_singleton_tp_group(pg_collection, model_config)
     else:
         # Use the original mcore parallel_state.initialize_model_parallel approach
         if parallel_state.model_parallel_is_initialized():
@@ -836,7 +855,8 @@ def _initialize_distributed(
                     f"{parallel_state.get_pipeline_model_parallel_world_size()}"
                 )
         # Return a ProcessGroupCollection using mpu process groups
-        return ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        return _attach_vision_singleton_tp_group(pg_collection, model_config)
 
 
 def _set_random_seed(
