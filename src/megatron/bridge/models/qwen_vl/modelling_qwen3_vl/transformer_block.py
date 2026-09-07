@@ -126,6 +126,40 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                 )
         return self.deepstack_merger_list[deepstack_idx](projector_input)
 
+    def forward_frozen_encoder(
+        self,
+        hidden_states: Tensor,
+        rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> tuple[Tensor, list[Tensor]]:
+        """Run only frozen ViT layers, keeping trainable projectors outside capture."""
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=False, keep_graph=False)
+        deepstack_hidden_states = []
+        context = None
+
+        for l_no, layer in enumerate(self.layers):
+            assert l_no == layer.layer_number - 1
+            hidden_states, context = layer(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                context=context,
+                context_mask=None,
+                rotary_pos_emb=rotary_pos_emb,
+                attention_bias=None,
+                inference_context=None,
+                packed_seq_params=packed_seq_params,
+            )
+            if l_no in self.deepstack_visual_indexes:
+                deepstack_hidden_states.append(hidden_states)
+
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=False, keep_graph=False
+            )
+
+        return hidden_states, deepstack_hidden_states
+
     def _checkpointed_forward(
         self,
         hidden_states: Tensor,

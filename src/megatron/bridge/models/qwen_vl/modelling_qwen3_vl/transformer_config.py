@@ -64,6 +64,12 @@ class Qwen3VLTransformerConfig(TransformerConfig):
     use_hf_vision_model: bool = False
     # Maximum sequence length for vision encoder CUDA graphs.
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Exact packed-shape graph for a frozen ViT encoder. Unlike the generic
+    # TE graph path, this preserves the per-image packed-attention boundaries.
+    vision_encoder_cuda_graph: bool = False
+    vision_encoder_cuda_graph_max_entries: int = 2
+    vision_encoder_cuda_graph_validate: bool = False
+    vision_encoder_cuda_graph_per_image: bool = False
 
 
 def get_vision_model_config(hf_config, megatron_config=None):
@@ -170,6 +176,19 @@ def get_vision_model_config(hf_config, megatron_config=None):
     # Propagate max vision CUDA graph sequence length from provider
     if megatron_config is not None and hasattr(megatron_config, "max_vision_cuda_graph_seq_length"):
         config.max_vision_cuda_graph_seq_length = megatron_config.max_vision_cuda_graph_seq_length
+    if megatron_config is not None:
+        config.vision_encoder_cuda_graph = getattr(
+            megatron_config, "vision_encoder_cuda_graph", False
+        )
+        config.vision_encoder_cuda_graph_max_entries = getattr(
+            megatron_config, "vision_encoder_cuda_graph_max_entries", 2
+        )
+        config.vision_encoder_cuda_graph_validate = getattr(
+            megatron_config, "vision_encoder_cuda_graph_validate", False
+        )
+        config.vision_encoder_cuda_graph_per_image = getattr(
+            megatron_config, "vision_encoder_cuda_graph_per_image", False
+        )
 
     if megatron_config is not None and hasattr(megatron_config, "use_cpu_initialization"):
         config.use_cpu_initialization = megatron_config.use_cpu_initialization

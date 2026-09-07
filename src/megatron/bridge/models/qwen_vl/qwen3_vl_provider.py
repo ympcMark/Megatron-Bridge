@@ -140,6 +140,11 @@ class Qwen3VLModelProvider(GPTModelProvider):
     # Maximum sequence length for vision encoder CUDA graphs (must accommodate largest input)
     # If None, calculated from num_position_embeddings / spatial_merge_size^2
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Packed-sequence-preserving CUDA graph for a frozen ViT encoder.
+    vision_encoder_cuda_graph: bool = False
+    vision_encoder_cuda_graph_max_entries: int = 2
+    vision_encoder_cuda_graph_validate: bool = False
+    vision_encoder_cuda_graph_per_image: bool = False
 
     def finalize(self) -> None:
         if self.vision_dp_over_tp_cp:
@@ -317,6 +322,11 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
     vision_cuda_graph_scope: List[str] = field(default_factory=list)
     # Maximum sequence length for vision encoder CUDA graphs (must accommodate largest input)
     max_vision_cuda_graph_seq_length: Optional[int] = None
+    # Packed-sequence-preserving CUDA graph for a frozen ViT encoder.
+    vision_encoder_cuda_graph: bool = False
+    vision_encoder_cuda_graph_max_entries: int = 2
+    vision_encoder_cuda_graph_validate: bool = False
+    vision_encoder_cuda_graph_per_image: bool = False
 
     def finalize(self) -> None:
         if self.vision_dp_over_tp_cp:

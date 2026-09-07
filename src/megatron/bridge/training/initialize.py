@@ -211,7 +211,10 @@ def torch_dist_init(
             rng_config.data_parallel_random_init,
             rng_config.te_rng_tracker,
             rng_config.inference_rng_tracker,
-            use_cudagraphable_rng=(model_config.cuda_graph_impl != "none"),
+            use_cudagraphable_rng=(
+                model_config.cuda_graph_impl != "none"
+                or getattr(model_config, "vision_encoder_cuda_graph", False)
+            ),
             pg_collection=pg_collection,
         )
 

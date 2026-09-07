@@ -35,6 +35,76 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
 )
 
 
+class _FrozenVisionCudaGraphEntry:
+    """Static buffers and captured outputs for one exact packed signature."""
+
+    def __init__(
+        self,
+        graph: torch.cuda.CUDAGraph,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+        output: torch.Tensor,
+        deepstack_outputs: list[torch.Tensor],
+    ) -> None:
+        self.graph = graph
+        self.hidden_states = hidden_states
+        self.rotary_pos_emb = rotary_pos_emb
+        self.packed_seq_params = packed_seq_params
+        self.output = output
+        self.deepstack_outputs = deepstack_outputs
+
+    def copy_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> None:
+        self.hidden_states.copy_(hidden_states)
+        self.rotary_pos_emb.copy_(rotary_pos_emb)
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+            "seq_idx",
+        ):
+            source = getattr(packed_seq_params, name)
+            target = getattr(self.packed_seq_params, name)
+            if source is not None and target is not None:
+                target.copy_(source)
+
+
+def _clone_packed_seq_params(packed_seq_params: PackedSeqParams) -> PackedSeqParams:
+    """Clone tensor metadata while preserving the packed-attention contract."""
+
+    def clone_tensor(name: str) -> Optional[torch.Tensor]:
+        tensor = getattr(packed_seq_params, name)
+        return tensor.clone() if tensor is not None else None
+
+    static_params = PackedSeqParams(
+        qkv_format=packed_seq_params.qkv_format,
+        cu_seqlens_q=clone_tensor("cu_seqlens_q"),
+        cu_seqlens_kv=clone_tensor("cu_seqlens_kv"),
+        cu_seqlens_q_padded=clone_tensor("cu_seqlens_q_padded"),
+        cu_seqlens_kv_padded=clone_tensor("cu_seqlens_kv_padded"),
+        max_seqlen_q=packed_seq_params.max_seqlen_q,
+        max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+        local_cp_size=packed_seq_params.local_cp_size,
+        cp_group=packed_seq_params.cp_group,
+        total_tokens=packed_seq_params.total_tokens,
+    )
+    if packed_seq_params.seq_idx is not None:
+        static_params.seq_idx = packed_seq_params.seq_idx.clone()
+    return static_params
+
+
+def _packed_tensor_signature(tensor: Optional[torch.Tensor]) -> Optional[tuple[int, ...]]:
+    if tensor is None:
+        return None
+    return tuple(tensor.detach().cpu().tolist())
+
+
 def _maybe_pad_vision_sequence_for_cuda_graph(
     hidden_states: torch.Tensor,
     rotary_pos_emb: torch.Tensor,
@@ -184,6 +254,9 @@ class Qwen3VLVisionModel(VisionModule):
             )
 
         self.input_tensor = None
+        self._vision_encoder_cuda_graph_entries: dict[tuple, _FrozenVisionCudaGraphEntry] = {}
+        self._vision_encoder_cuda_graph_fallback_signatures: set[tuple] = set()
+        self._vision_encoder_cuda_graph_per_image_validated = False
 
     def _synchronize_replicated_encoder_weights(self) -> None:
         """Make TP=1 frozen encoder replicas identical within each LLM TP group."""
@@ -329,6 +402,221 @@ class Qwen3VLVisionModel(VisionModule):
             and self.training
         )
 
+    def _uses_frozen_encoder_cuda_graph(self) -> bool:
+        """Whether the packed-sequence-preserving frozen encoder graph is enabled."""
+        if not (
+            self.training
+            and torch.cuda.is_available()
+            and getattr(self.config, "vision_encoder_cuda_graph", False)
+        ):
+            return False
+        if self._uses_vision_cuda_graph():
+            raise RuntimeError(
+                "vision_encoder_cuda_graph and vision_cuda_graph_impl cannot be enabled together"
+            )
+        if any(parameter.requires_grad for parameter in self.decoder.layers.parameters()):
+            raise RuntimeError("vision_encoder_cuda_graph requires frozen ViT encoder layers")
+        return True
+
+    @staticmethod
+    def _vision_encoder_cuda_graph_signature(
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> tuple:
+        """Use exact packed offsets so a cached graph never changes image isolation."""
+        return (
+            tuple(hidden_states.shape),
+            hidden_states.dtype,
+            tuple(rotary_pos_emb.shape),
+            rotary_pos_emb.dtype,
+            packed_seq_params.qkv_format,
+            packed_seq_params.max_seqlen_q,
+            packed_seq_params.max_seqlen_kv,
+            _packed_tensor_signature(packed_seq_params.cu_seqlens_q),
+            _packed_tensor_signature(packed_seq_params.cu_seqlens_kv),
+            _packed_tensor_signature(packed_seq_params.cu_seqlens_q_padded),
+            _packed_tensor_signature(packed_seq_params.cu_seqlens_kv_padded),
+        )
+
+    def _capture_frozen_encoder_cuda_graph(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> _FrozenVisionCudaGraphEntry:
+        """Warm up and capture the frozen encoder for one exact packed shape."""
+        static_hidden_states = hidden_states.clone()
+        static_rotary_pos_emb = rotary_pos_emb.clone()
+        static_packed_seq_params = _clone_packed_seq_params(packed_seq_params)
+
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        reference_outputs = None
+        with torch.cuda.stream(capture_stream), torch.no_grad():
+            for _ in range(3):
+                warmup_output, warmup_deepstack = self.decoder.forward_frozen_encoder(
+                    static_hidden_states,
+                    static_rotary_pos_emb,
+                    static_packed_seq_params,
+                )
+            if getattr(self.config, "vision_encoder_cuda_graph_validate", False):
+                reference_outputs = [warmup_output.clone()]
+                reference_outputs.extend(output.clone() for output in warmup_deepstack)
+
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(graph, stream=capture_stream):
+            output, deepstack_outputs = self.decoder.forward_frozen_encoder(
+                static_hidden_states,
+                static_rotary_pos_emb,
+                static_packed_seq_params,
+            )
+        graph.replay()
+
+        entry = _FrozenVisionCudaGraphEntry(
+            graph,
+            static_hidden_states,
+            static_rotary_pos_emb,
+            static_packed_seq_params,
+            output,
+            deepstack_outputs,
+        )
+
+        if reference_outputs is not None:
+            captured_outputs = [output, *deepstack_outputs]
+            max_abs_error = max(
+                float((captured - reference).abs().max().item())
+                for captured, reference in zip(captured_outputs, reference_outputs)
+            )
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(
+                f"[Vision CUDA Graph] rank={rank} packed correctness max_abs_error="
+                f"{max_abs_error:.8e}",
+                flush=True,
+            )
+            if max_abs_error > 0.125:
+                raise RuntimeError(
+                    "Vision CUDA Graph failed eager parity: "
+                    f"max_abs_error={max_abs_error:.8e}"
+                )
+        return entry
+
+    def _run_frozen_encoder_cuda_graph(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Replay a matching graph, capture a new signature, or safely run eager."""
+        signature = self._vision_encoder_cuda_graph_signature(
+            hidden_states, rotary_pos_emb, packed_seq_params
+        )
+        entry = self._vision_encoder_cuda_graph_entries.get(signature)
+        if entry is None:
+            max_entries = int(getattr(self.config, "vision_encoder_cuda_graph_max_entries", 2))
+            if len(self._vision_encoder_cuda_graph_entries) >= max_entries:
+                if signature not in self._vision_encoder_cuda_graph_fallback_signatures:
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(
+                        f"[Vision CUDA Graph] rank={rank} exact-shape cache full "
+                        f"({max_entries}); using eager fallback",
+                        flush=True,
+                    )
+                    self._vision_encoder_cuda_graph_fallback_signatures.add(signature)
+                with torch.no_grad():
+                    return self.decoder.forward_frozen_encoder(
+                        hidden_states, rotary_pos_emb, packed_seq_params
+                    )
+            entry = self._capture_frozen_encoder_cuda_graph(
+                hidden_states, rotary_pos_emb, packed_seq_params
+            )
+            self._vision_encoder_cuda_graph_entries[signature] = entry
+            return entry.output, entry.deepstack_outputs
+
+        entry.copy_inputs(hidden_states, rotary_pos_emb, packed_seq_params)
+        entry.graph.replay()
+        return entry.output, entry.deepstack_outputs
+
+    def _run_frozen_encoder_cuda_graph_per_image(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        grid_thw: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Replay the frozen encoder independently for every image/video item."""
+        validate_stitching = (
+            getattr(self.config, "vision_encoder_cuda_graph_validate", False)
+            and not self._vision_encoder_cuda_graph_per_image_validated
+        )
+        reference_outputs = None
+        if validate_stitching:
+            with torch.no_grad():
+                reference_output, reference_deepstack = self.decoder.forward_frozen_encoder(
+                    hidden_states,
+                    rotary_pos_emb,
+                    packed_seq_params,
+                )
+            reference_outputs = [reference_output.clone()]
+            reference_outputs.extend(output.clone() for output in reference_deepstack)
+
+        token_counts = torch.prod(grid_thw, dim=1).detach().cpu().tolist()
+        output_chunks = []
+        deepstack_chunks: Optional[list[list[torch.Tensor]]] = None
+        token_offset = 0
+        for item_idx, token_count_value in enumerate(token_counts):
+            token_count = int(token_count_value)
+            token_end = token_offset + token_count
+            item_packed_seq_params = self.build_packed_seq_params(grid_thw[item_idx : item_idx + 1])
+            item_output, item_deepstack = self._run_frozen_encoder_cuda_graph(
+                hidden_states[token_offset:token_end],
+                rotary_pos_emb[token_offset:token_end],
+                item_packed_seq_params,
+            )
+            output_chunks.append(item_output.clone())
+            if deepstack_chunks is None:
+                deepstack_chunks = [[] for _ in item_deepstack]
+            for deepstack_idx, feature in enumerate(item_deepstack):
+                deepstack_chunks[deepstack_idx].append(feature.clone())
+            token_offset = token_end
+
+        assert token_offset == hidden_states.shape[0]
+        output = torch.cat(output_chunks, dim=0)
+        deepstack_outputs = [
+            torch.cat(feature_chunks, dim=0) for feature_chunks in (deepstack_chunks or [])
+        ]
+
+        if reference_outputs is not None:
+            stitched_outputs = [output, *deepstack_outputs]
+            differences = [
+                (stitched - reference).abs()
+                for stitched, reference in zip(stitched_outputs, reference_outputs)
+            ]
+            max_abs_error = max(float(difference.max().item()) for difference in differences)
+            mean_abs_error = sum(float(difference.mean().item()) for difference in differences) / len(
+                differences
+            )
+            reference_abs_max = max(float(reference.abs().max().item()) for reference in reference_outputs)
+            relative_max_error = max_abs_error / max(reference_abs_max, 1.0e-12)
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(
+                f"[Vision CUDA Graph per-image] rank={rank} packed-vs-stitched "
+                f"max_abs_error={max_abs_error:.8e} mean_abs_error={mean_abs_error:.8e} "
+                f"relative_max_error={relative_max_error:.8e}",
+                flush=True,
+            )
+            if max_abs_error > 0.5 and relative_max_error > 0.05:
+                raise RuntimeError(
+                    "Per-image Vision CUDA Graph failed packed eager parity: "
+                    f"max_abs_error={max_abs_error:.8e}, relative_max_error={relative_max_error:.8e}"
+                )
+            self._vision_encoder_cuda_graph_per_image_validated = True
+
+        return output, deepstack_outputs
+
     def forward(
         self,
         hidden_states: Optional[torch.Tensor],
@@ -381,15 +669,40 @@ class Qwen3VLVisionModel(VisionModule):
             grid_thw=grid_thw,
             build_packed_seq_params=self.build_packed_seq_params,
         )
-        hidden_states, deepstack_feature_lists = self.decoder(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            vision_tp_gather_seqlens=vision_tp_gather_seqlens,
-            **(extra_block_kwargs or {}),
-        )
+        if self._uses_frozen_encoder_cuda_graph():
+            if getattr(self.config, "vision_encoder_cuda_graph_per_image", False):
+                hidden_states, deepstack_hidden_states = (
+                    self._run_frozen_encoder_cuda_graph_per_image(
+                        hidden_states,
+                        rotary_pos_emb,
+                        grid_thw,
+                        packed_seq_params,
+                    )
+                )
+            else:
+                hidden_states, deepstack_hidden_states = self._run_frozen_encoder_cuda_graph(
+                    hidden_states,
+                    rotary_pos_emb,
+                    packed_seq_params,
+                )
+            deepstack_feature_lists = [
+                self.decoder._project_deepstack_feature(
+                    feature,
+                    deepstack_idx,
+                    vision_tp_gather_seqlens,
+                )
+                for deepstack_idx, feature in enumerate(deepstack_hidden_states)
+            ]
+        else:
+            hidden_states, deepstack_feature_lists = self.decoder(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                vision_tp_gather_seqlens=vision_tp_gather_seqlens,
+                **(extra_block_kwargs or {}),
+            )
         # Remove padding if we added it
         if use_cuda_graph_padding and original_seq_len < seq_len:
             hidden_states = hidden_states[:original_seq_len]
