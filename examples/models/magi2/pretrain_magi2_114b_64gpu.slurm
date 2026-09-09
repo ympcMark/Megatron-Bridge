@@ -23,7 +23,7 @@ export NCCL_DEBUG=WARN
 
 WORKSPACE=/lustre/fsw/coreai_devtech_all/pima/magi2_workspace
 REPO="$WORKSPACE/Megatron-Bridge"
-MCORE_REPO="$REPO/3rdparty/Megatron-LM"
+export MCORE_REPO="${MCORE_REPO:-$WORKSPACE/Megatron-LM}"
 CONTAINER_IMAGE=/lustre/fsw/coreai_devtech_all/pima/containers/nemo_26.04_qwen3vl_te-main-779f17d_fa4b26.sqsh
 CONTAINER_MOUNTS=/lustre/fsw/coreai_devtech_all/pima:/lustre/fsw/coreai_devtech_all/pima
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
@@ -34,6 +34,10 @@ RESUME_LOSS="$RUN_ROOT/resume_051_052.jsonl"
 
 test ! -e "$RUN_ROOT"
 mkdir -p "$RUN_ROOT"
+{
+  printf 'Megatron-Bridge %s\n' "$(git -C "$REPO" rev-parse HEAD)"
+  printf 'Megatron-LM %s\n' "$(git -C "$MCORE_REPO" rev-parse HEAD)"
+} > "$RUN_ROOT/software_revisions.txt"
 
 run_magi2() {
   local master_port=$1
@@ -54,9 +58,10 @@ run_magi2() {
 }
 
 run_magi2 29651 \
-  --train-iters 50 \
+  --train-iters 52 \
   --lr-decay-iters 52 \
   --save-interval 50 \
+  --exit-interval 50 \
   --checkpoint-dir "$CHECKPOINT" \
   --loss-output "$MAIN_LOSS" \
   --tensorboard-dir "$RUN_ROOT/tensorboard"
@@ -81,6 +86,9 @@ python3 "$REPO/examples/models/magi2/analyze_magi2_run.py" \
   "$RESUME_LOSS" --expected-start 51 --expected-end 52 --warmup-steps 0 \
   --output "$RUN_ROOT/resume_report.json"
 sha256sum \
+  "$RUN_ROOT/software_revisions.txt" \
   "$MAIN_LOSS" "$MAIN_LOSS.manifest.json" \
   "$RESUME_LOSS" "$RESUME_LOSS.manifest.json" \
   "$RUN_ROOT/train_report.json" "$RUN_ROOT/resume_report.json"
+du -sh "$CHECKPOINT"
+echo "MAGI2_STAGE7_FORMAL status=passed world_size=64 ep=64 checkpoint_iteration=50 resume_iterations=51-52"
