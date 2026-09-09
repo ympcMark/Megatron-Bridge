@@ -86,6 +86,14 @@ def _validate_sequence_row_tensor(row: Mapping[str, Any], key: str, *, length: i
     return tensor
 
 
+def _validate_sequence_row_position_ids(row: Mapping[str, Any], *, length: int) -> torch.Tensor:
+    """Validate ordinary ``[S]`` or multi-axis ``[A, S]`` position IDs."""
+    tensor = row.get("position_ids")
+    if not isinstance(tensor, torch.Tensor) or tensor.dim() not in (1, 2) or tensor.size(-1) != length:
+        raise ValueError("'position_ids' must be [S] or [axes, S] and match its token row.")
+    return tensor
+
+
 def build_mcore_thd_sequence_batch_from_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -139,11 +147,12 @@ def build_mcore_thd_sequence_batch_from_rows(
                 f"Packed sequence row length {row_length} exceeds configured sequence_length {sequence_length}."
             )
 
-        normalized_row = {token_key: tokens}
-        for key in ("position_ids", "labels", "loss_mask", *extra_pad_values):
+        normalized_row = {
+            token_key: tokens,
+            "position_ids": _validate_sequence_row_position_ids(row, length=row_length),
+        }
+        for key in ("labels", "loss_mask", *extra_pad_values):
             tensor = _validate_sequence_row_tensor(row, key, length=row_length)
-            if key == "position_ids" and tensor is None:
-                raise ValueError("Direct sequence packing requires a position_ids row.")
             if tensor is not None:
                 normalized_row[key] = tensor
 
@@ -167,16 +176,32 @@ def build_mcore_thd_sequence_batch_from_rows(
 
     first_row = normalized_rows[0]
     first_tokens = first_row[token_key]
+    first_position_ids = first_row["position_ids"]
+    position_rank = first_position_ids.dim()
+    position_axes = first_position_ids.size(0) if position_rank == 2 else None
+    for row in normalized_rows[1:]:
+        row_position_ids = row["position_ids"]
+        if row_position_ids.dim() != position_rank or (
+            position_rank == 2 and row_position_ids.size(0) != position_axes
+        ):
+            raise ValueError("All packed rows must use the same position_ids rank and axis count.")
     total_length = cu_seqlens_padded[-1]
+    if position_rank == 1:
+        packed_position_shape = (1, total_length)
+    else:
+        packed_position_shape = (position_axes, 1, total_length)
     packed: dict[str, Any] = {
         token_key: torch.full((1, total_length), pad_token_id, dtype=first_tokens.dtype, device=first_tokens.device),
         "position_ids": torch.zeros(
-            (1, total_length),
-            dtype=first_row["position_ids"].dtype,
-            device=first_row["position_ids"].device,
+            packed_position_shape,
+            dtype=first_position_ids.dtype,
+            device=first_position_ids.device,
         ),
         "attention_mask": None,
     }
+    if position_rank == 2:
+        # Match Qwen's model-side packed M-RoPE construction for alignment padding.
+        packed["position_ids"].fill_(1)
 
     output_pad_values: dict[str, int | float] = {"labels": ignore_index, "loss_mask": 0, **extra_pad_values}
     for key, pad_value in output_pad_values.items():
@@ -187,13 +212,16 @@ def build_mcore_thd_sequence_batch_from_rows(
     offset = 0
     for row, length, padded_length in zip(normalized_rows, unpadded_lengths, padded_lengths):
         packed[token_key][0, offset : offset + length] = row[token_key]
-        packed["position_ids"][0, offset : offset + length] = row["position_ids"]
+        if position_rank == 1:
+            packed["position_ids"][0, offset : offset + length] = row["position_ids"]
+        else:
+            packed["position_ids"][:, 0, offset : offset + length] = row["position_ids"]
         for key in output_pad_values:
             if key in packed:
                 packed[key][0, offset : offset + length] = row[key]
 
         pad_length = padded_length - length
-        if pad_length > 0:
+        if pad_length > 0 and position_rank == 1:
             start_position = row["position_ids"][-1] + 1
             packed["position_ids"][0, offset + length : offset + padded_length] = torch.arange(
                 start_position,
@@ -256,8 +284,18 @@ def pack_right_padded_sequence_batch_to_mcore_thd(
         raise ValueError("Direct sequence packing expects a 2D token tensor.")
 
     position_ids = batch.get("position_ids")
-    if not isinstance(position_ids, torch.Tensor) or position_ids.dim() != 2 or position_ids.shape != tokens.shape:
-        raise ValueError("Direct sequence packing expects 2D 'position_ids' matching token shape.")
+    ordinary_position_ids = (
+        isinstance(position_ids, torch.Tensor) and position_ids.dim() == 2 and position_ids.shape == tokens.shape
+    )
+    multi_axis_position_ids = (
+        isinstance(position_ids, torch.Tensor)
+        and position_ids.dim() == 3
+        and position_ids.shape[1:] == tokens.shape
+    )
+    if not ordinary_position_ids and not multi_axis_position_ids:
+        raise ValueError(
+            "Direct sequence packing expects position_ids shaped like [B, S] or [axes, B, S]."
+        )
 
     labels = _validate_sequence_tensor(batch, "labels", tokens=tokens)
     loss_mask = _validate_sequence_tensor(batch, "loss_mask", tokens=tokens)
@@ -285,7 +323,11 @@ def pack_right_padded_sequence_batch_to_mcore_thd(
         length = lengths[batch_idx]
         row = {
             token_key: tokens[batch_idx, :length],
-            "position_ids": position_ids[batch_idx, :length],
+            "position_ids": (
+                position_ids[batch_idx, :length]
+                if ordinary_position_ids
+                else position_ids[:, batch_idx, :length]
+            ),
         }
         if labels is not None:
             row["labels"] = labels[batch_idx, :length]

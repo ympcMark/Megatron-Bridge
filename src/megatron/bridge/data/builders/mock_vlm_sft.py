@@ -82,6 +82,7 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
     in_batch_packing_pad_to_multiple_of: int = 1
     cache_path: str | None = None
     cache_micro_batch_size: int | None = None
+    online_mock: bool = False
 
     def validate(self) -> None:
         """Validate synthetic data settings."""
@@ -105,6 +106,8 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
             raise ValueError("in_batch_packing_pad_to_multiple_of must be greater than 0.")
         if self.cache_path is not None and (self.cache_micro_batch_size is None or self.cache_micro_batch_size <= 0):
             raise ValueError("cache_micro_batch_size must be positive when cache_path is set.")
+        if self.online_mock and self.cache_path is not None:
+            raise ValueError("online_mock and cache_path are mutually exclusive.")
 
     def finalize(self) -> None:
         """Finalize dataloader settings and validate this config."""
@@ -170,6 +173,64 @@ def make_mock_vlm_examples(config: MockVLMSFTDatasetConfig) -> list[dict[str, An
     return examples
 
 
+def make_online_mock_vlm_example(config: MockVLMSFTDatasetConfig, index: int) -> dict[str, Any]:
+    """Generate one deterministic raw mock example lazily inside a DataLoader worker."""
+    logical_index = int(index) % config.num_base_examples
+    rng = numpy.random.default_rng(numpy.random.SeedSequence([config.random_seed, logical_index]))
+
+    if config.ratio is None:
+        response_length_range = (10, 100) if config.enable_in_batch_packing else (10, 30)
+        response_length = int(rng.integers(*response_length_range))
+        num_images = config.num_images
+    else:
+        width, height = config.image_size
+        image_tokens_per_image = max(1, math.ceil(width / 16) * math.ceil(height / 16) // 4)
+        images_per_unit = max(1, config.num_images)
+        image_tokens_per_unit = images_per_unit * image_tokens_per_image
+        words_per_unit = max(1, math.ceil(image_tokens_per_unit * config.ratio))
+        repeats = max(1, math.ceil(config.seq_length / (image_tokens_per_unit + words_per_unit)))
+        response_length = words_per_unit * repeats
+        num_images = images_per_unit * repeats
+
+    response = " ".join(rng.choice(_MOCK_RESPONSE_VOCABULARY, size=response_length))
+    return make_mock_vlm_example(config, rng, response, num_images=num_images)
+
+
+class OnlineMockVLMSFTDataset(DirectSFTDataset):
+    """Generate raw VLM examples on demand and collate them in DataLoader workers.
+
+    Only the deterministic recipe is resident in memory. Images, processor outputs,
+    grids, M-RoPE IDs, and padded tensors are rebuilt for every requested sample.
+    """
+
+    def __init__(
+        self,
+        config: MockVLMSFTDatasetConfig,
+        target_length: int,
+        processor: Any,
+    ) -> None:
+        # DirectSFTDataset owns the canonical processor-aware collate binding. The
+        # placeholder is never returned because __getitem__ is overridden below.
+        super().__init__(
+            base_examples=[{"conversation": []}],
+            target_length=target_length,
+            processor=processor,
+            collate_impl=None,
+            sequence_length=config.seq_length,
+            pad_to_max_length=config.pad_to_max_length,
+            pad_to_multiple_of=config.pad_to_multiple_of,
+            enable_in_batch_packing=config.enable_in_batch_packing,
+            defer_in_batch_packing_to_step=config.defer_in_batch_packing_to_step,
+            in_batch_packing_pad_to_multiple_of=config.in_batch_packing_pad_to_multiple_of,
+        )
+        self._mock_config = config
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if len(self) == 0:
+            raise IndexError("Empty dataset")
+        return make_online_mock_vlm_example(self._mock_config, idx)
+
+
 def build_mock_vlm_sft_split(
     config: MockVLMSFTDatasetConfig,
     base_examples: list[dict[str, Any]],
@@ -191,6 +252,17 @@ def build_mock_vlm_sft_split(
         defer_in_batch_packing_to_step=config.defer_in_batch_packing_to_step,
         in_batch_packing_pad_to_multiple_of=config.in_batch_packing_pad_to_multiple_of,
     )
+
+
+def build_online_mock_vlm_sft_split(
+    config: MockVLMSFTDatasetConfig,
+    target_length: int,
+    processor: Any,
+) -> OnlineMockVLMSFTDataset | None:
+    """Build a split whose raw examples and collated tensors are produced online."""
+    if target_length <= 0:
+        return None
+    return OnlineMockVLMSFTDataset(config=config, target_length=target_length, processor=processor)
 
 
 class MockVLMSFTDatasetBuilder:
@@ -249,6 +321,12 @@ class MockVLMSFTDatasetBuilder:
                 hf_path=self.config.hf_processor_path,
             ),
         )
+        if self.config.online_mock:
+            return (
+                build_online_mock_vlm_sft_split(self.config, context.train_samples, processor),
+                build_online_mock_vlm_sft_split(self.config, context.valid_samples, processor),
+                build_online_mock_vlm_sft_split(self.config, context.test_samples, processor),
+            )
         base_examples = make_mock_vlm_examples(self.config)
         return (
             build_mock_vlm_sft_split(self.config, base_examples, context.train_samples, processor),

@@ -302,10 +302,14 @@ def forward_step(
         "labels": labels,
         "loss_mask": loss_mask,
         "attention_mask": attention_mask,
-        "position_ids": position_ids,
+        # MCore's generic CP batch helper assumes [B, S, ...] tensors and
+        # cannot partition Qwen M-RoPE's [3, B, S] layout. The Qwen model
+        # already owns the correct packed/non-packed CP slicing along dim 2.
+        "position_ids": None,
     }
 
     original_tokens = tokens.clone()
+    explicit_mrope_position_ids = position_ids if position_ids is not None and position_ids.dim() == 3 else None
     forward_args = get_batch_on_this_cp_rank(
         forward_args,
         is_hybrid_cp=False,
@@ -313,8 +317,9 @@ def forward_step(
     )
     forward_args["packed_seq_params"] = None
     forward_args["input_ids"] = original_tokens
-    # calculate position_ids in model forward
-    forward_args["position_ids"] = None
+    # Explicit 3D M-RoPE IDs are collated on CPU and sliced by model.forward.
+    # Preserve the model-side calculation as a fallback for 2D/custom inputs.
+    forward_args["position_ids"] = explicit_mrope_position_ids
     if enable_in_batch_packing:
         if forward_args["labels"] is not None:
             # When using pp, labels could be None

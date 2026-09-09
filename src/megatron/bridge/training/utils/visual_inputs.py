@@ -48,6 +48,14 @@ class GenericVisualInputs:
     image_position_ids: Optional[torch.Tensor] = None  # Gemma4-VL: 2D patch position coords [B, N, 2]
     mm_token_type_ids: Optional[torch.Tensor] = None
 
+    def pin_memory(self) -> "GenericVisualInputs":
+        """Pin contained CPU tensors so non-blocking H2D copies are effective."""
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu" and not value.is_pinned():
+                setattr(self, f.name, value.pin_memory())
+        return self
+
     def as_model_kwargs(self) -> dict[str, torch.Tensor]:
         """Return a mapping of non-None fields suitable for model forward kwargs."""
         result: dict[str, torch.Tensor] = {}

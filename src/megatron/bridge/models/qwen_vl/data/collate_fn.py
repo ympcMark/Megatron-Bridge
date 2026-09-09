@@ -31,6 +31,7 @@ from megatron.bridge.data.conversation_processing import (
 from megatron.bridge.data.datasets.utils import IGNORE_INDEX
 from megatron.bridge.data.packing.in_batch import build_mcore_thd_sequence_batch_from_rows
 from megatron.bridge.data.token_utils import extract_skipped_token_ids
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 
@@ -44,6 +45,11 @@ CHATML_ASSISTANT_START = "<|im_start|>assistant\n"
 CHATML_ASSISTANT_END = "<|im_end|>\n"
 CHATML_OTHER_ROLE_STARTS = {role: f"<|im_start|>{role}\n" for role in ("system", "developer", "user", "tool")}
 QWEN_VISUAL_KEYS = (*THW_GRID_VISUAL_KEYS, "second_per_grid_ts")
+_QWEN_SPECIAL_TOKEN_DEFAULTS = {
+    "image_token_id": ("<|image_pad|>", 151655),
+    "video_token_id": ("<|video_pad|>", 151656),
+    "vision_start_token_id": ("<|vision_start|>", 151652),
+}
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -51,6 +57,109 @@ try:
     HAVE_QWEN_VL_UTILS = True
 except ImportError:
     HAVE_QWEN_VL_UTILS = False
+
+
+def _resolve_qwen_special_token_id(processor: Any, attribute: str) -> int:
+    """Resolve a Qwen visual token ID without tying the collator to one model size."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    for owner in (processor, tokenizer):
+        value = getattr(owner, attribute, None)
+        if isinstance(value, int):
+            return value
+
+    token, fallback = _QWEN_SPECIAL_TOKEN_DEFAULTS[attribute]
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert_tokens_to_ids):
+        value = convert_tokens_to_ids(token)
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        if isinstance(value, int) and value >= 0 and value != unk_token_id:
+            return value
+    return fallback
+
+
+def _qwen_spatial_merge_size(processor: Any) -> int:
+    image_processor = getattr(processor, "image_processor", None)
+    for owner in (image_processor, processor):
+        for attribute in ("merge_size", "spatial_merge_size"):
+            value = getattr(owner, attribute, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return 2
+
+
+def _flatten_grid_thw(grid_thw: torch.Tensor | None) -> torch.Tensor | None:
+    if not isinstance(grid_thw, torch.Tensor) or grid_thw.numel() == 0:
+        return None
+    return grid_thw.reshape(-1, grid_thw.size(-1)).contiguous()
+
+
+def _build_cpu_mrope_position_ids(
+    processor: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+) -> torch.Tensor:
+    """Build explicit Qwen M-RoPE IDs while token/grid metadata is still on CPU."""
+    if input_ids.device.type != "cpu":
+        raise ValueError("Collate-time M-RoPE construction expects CPU input_ids.")
+    position_ids, _ = get_rope_index(
+        spatial_merge_size=_qwen_spatial_merge_size(processor),
+        image_token_id=_resolve_qwen_special_token_id(processor, "image_token_id"),
+        video_token_id=_resolve_qwen_special_token_id(processor, "video_token_id"),
+        vision_start_token_id=_resolve_qwen_special_token_id(processor, "vision_start_token_id"),
+        input_ids=input_ids.unsqueeze(0),
+        image_grid_thw=_flatten_grid_thw(image_grid_thw),
+        video_grid_thw=_flatten_grid_thw(video_grid_thw),
+        attention_mask=attention_mask.unsqueeze(0) if attention_mask is not None else None,
+    )
+    return position_ids[:, 0].contiguous()
+
+
+def _build_cpu_mrope_batch(
+    processor: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+    image_counts: list[int],
+    video_counts: list[int],
+) -> torch.Tensor:
+    """Build ``[3, B, S]`` position IDs and preserve per-row media ownership."""
+    image_grid_thw = _flatten_grid_thw(image_grid_thw)
+    video_grid_thw = _flatten_grid_thw(video_grid_thw)
+    image_offset = 0
+    video_offset = 0
+    rows = []
+    for row_idx, (image_count, video_count) in enumerate(zip(image_counts, video_counts, strict=True)):
+        row_image_grid = (
+            image_grid_thw[image_offset : image_offset + image_count]
+            if image_count and image_grid_thw is not None
+            else None
+        )
+        row_video_grid = (
+            video_grid_thw[video_offset : video_offset + video_count]
+            if video_count and video_grid_thw is not None
+            else None
+        )
+        row_attention_mask = attention_mask[row_idx] if attention_mask is not None else None
+        rows.append(
+            _build_cpu_mrope_position_ids(
+                processor,
+                input_ids[row_idx],
+                row_attention_mask,
+                row_image_grid,
+                row_video_grid,
+            )
+        )
+        image_offset += image_count
+        video_offset += video_count
+
+    if image_grid_thw is not None and image_offset != image_grid_thw.size(0):
+        raise ValueError("image_grid_thw rows do not match the images assigned to collated examples.")
+    if video_grid_thw is not None and video_offset != video_grid_thw.size(0):
+        raise ValueError("video_grid_thw rows do not match the videos assigned to collated examples.")
+    return torch.stack(rows, dim=1).contiguous()
 
 
 def _normalize_qwen_video_paths(example: dict[str, Any]) -> dict[str, Any]:
@@ -181,11 +290,13 @@ def qwen2_5_collate_fn(
                     attention_mask = torch.ones_like(input_ids)
                 else:
                     attention_mask = attention_mask[0]
-                position_ids = sample_batch.get("position_ids")
-                if position_ids is None:
-                    position_ids = torch.arange(input_ids.numel(), device=input_ids.device, dtype=torch.long)
-                else:
-                    position_ids = position_ids[0]
+                position_ids = _build_cpu_mrope_position_ids(
+                    processor,
+                    input_ids,
+                    attention_mask,
+                    sample_batch.get("image_grid_thw"),
+                    sample_batch.get("video_grid_thw"),
+                )
 
                 loss_mask = build_assistant_loss_mask(
                     example,
@@ -315,15 +426,15 @@ def qwen2_5_collate_fn(
             if key in batch_with:
                 batch[key] = batch_with[key]
 
-    if "position_ids" not in batch:
-        batch_size, seq_len = batch["input_ids"].shape
-        batch["position_ids"] = (
-            torch.arange(seq_len, device=batch["input_ids"].device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            .clone()
-            .contiguous()
-        )
+    batch["position_ids"] = _build_cpu_mrope_batch(
+        processor,
+        batch["input_ids"],
+        batch.get("attention_mask"),
+        batch.get("image_grid_thw"),
+        batch.get("video_grid_thw"),
+        [len(images) for images in per_example_images],
+        [len(videos) for videos in per_example_videos],
+    )
 
     loss_mask = torch.stack(
         [

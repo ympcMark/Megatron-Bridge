@@ -52,13 +52,18 @@ def pad_or_truncate_2d_to_len(
 def pad_or_truncate_pos_to_len(pos: torch.Tensor | None, target_len: int, max_cap: int) -> torch.Tensor | None:
     """Pad or truncate position ids to a target length with an upper cap.
 
-    Extends positions by appending a monotonically increasing range starting
-    from the current length to the target length.
+    Supports ordinary ``[B, S]`` IDs and multi-axis ``[A, B, S]`` IDs. Ordinary
+    positions are extended monotonically; multi-axis padding is filled with one
+    to match Qwen's model-side M-RoPE fallback.
     """
     if pos is None:
         return None
-    current_len = pos.size(1)
+    if pos.dim() not in (2, 3):
+        raise ValueError(f"position ids must be 2D or 3D, got shape {tuple(pos.shape)}")
+    current_len = pos.size(-1)
     if current_len < target_len:
+        if pos.dim() == 3:
+            return F.pad(pos, (0, target_len - current_len), value=1)
         addition = (
             torch.arange(current_len, target_len, device=pos.device, dtype=pos.dtype)
             .unsqueeze(0)
@@ -66,7 +71,7 @@ def pad_or_truncate_pos_to_len(pos: torch.Tensor | None, target_len: int, max_ca
         )
         return torch.cat([pos, addition], dim=1)
     if current_len > max_cap:
-        return pos[:, :max_cap]
+        return pos[..., :max_cap]
     return pos
 
 

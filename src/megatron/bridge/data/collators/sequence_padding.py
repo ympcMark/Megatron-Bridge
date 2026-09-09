@@ -86,10 +86,14 @@ def _pad_or_truncate_position_ids(
 ) -> torch.Tensor | None:
     if position_ids is None:
         return None
-    if position_ids.dim() != 2:
-        raise ValueError(f"Expected 2D position_ids, got shape {tuple(position_ids.shape)}.")
-    current_length = position_ids.size(1)
+    if position_ids.dim() not in (2, 3):
+        raise ValueError(f"Expected 2D or 3D position_ids, got shape {tuple(position_ids.shape)}.")
+    current_length = position_ids.size(-1)
     if current_length < target_length:
+        if position_ids.dim() == 3:
+            # Qwen M-RoPE uses [axes, batch, sequence]. Match the model-side
+            # fallback, which initializes padding positions to one.
+            return F.pad(position_ids, (0, target_length - current_length), value=1).contiguous()
         addition = (
             torch.arange(current_length, target_length, device=position_ids.device, dtype=position_ids.dtype)
             .unsqueeze(0)
@@ -97,7 +101,7 @@ def _pad_or_truncate_position_ids(
         )
         return torch.cat([position_ids, addition], dim=1).contiguous()
     if current_length > target_length:
-        return position_ids[:, :target_length].contiguous()
+        return position_ids[..., :target_length].contiguous()
     return position_ids.contiguous()
 
 
