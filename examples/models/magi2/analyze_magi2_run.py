@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse the JSONL validation and summary arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("jsonl", type=Path)
     parser.add_argument("--expected-start", type=int, required=True)
@@ -21,6 +22,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Validate one run's metrics and write a compact summary report."""
     args = parse_args()
     rows = [json.loads(line) for line in args.jsonl.read_text().splitlines() if line]
     expected_steps = list(range(args.expected_start, args.expected_end + 1))
@@ -57,12 +59,8 @@ def main() -> None:
             "mean": statistics.fmean(measured_throughputs),
             "median": statistics.median(measured_throughputs),
         },
-        "peak_memory_allocated_gib": max(
-            float(row["memory_allocated_gib"]["max"]) for row in rows
-        ),
-        "peak_memory_reserved_gib": max(
-            float(row["memory_reserved_gib"]["max"]) for row in rows
-        ),
+        "peak_memory_allocated_gib": max(float(row["memory_allocated_gib"]["max"]) for row in rows),
+        "peak_memory_reserved_gib": max(float(row["memory_reserved_gib"]["max"]) for row in rows),
         "skipped_iterations": 0,
     }
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

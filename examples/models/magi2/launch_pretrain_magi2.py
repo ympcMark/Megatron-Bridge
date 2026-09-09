@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -11,7 +12,8 @@ from types import ModuleType
 
 repo = Path(__file__).resolve().parents[3]
 src = repo / "src"
-sys.path.insert(0, str(repo / "3rdparty" / "Megatron-LM"))
+mcore_repo = Path(os.environ.get("MCORE_REPO", repo / "3rdparty" / "Megatron-LM"))
+sys.path.insert(0, str(mcore_repo))
 sys.path.insert(0, str(src))
 
 for package, path in (

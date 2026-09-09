@@ -12,29 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MAGI-2 diffusion model components."""
+"""Bridge training integration for MCore's native MAGI-2 model."""
 
-from megatron.bridge.diffusion.models.magi2.modeling_magi2 import (
-    Magi2ArchitectureConfig,
-    Magi2DistributedMultiHeadMoE,
-    Magi2Model,
-    Magi2Modality,
-    Magi2MultiHeadMoEConfig,
-    Magi2MultiHeadTopKRouter,
-    Magi2ReferenceMultiHeadMoE,
-    build_magi2_expert_config,
-    multi_head_topk_routing,
+from megatron.bridge.diffusion.models.magi2.data import (
+    Magi2LatentDataset,
+    Magi2LatentDatasetConfig,
 )
+from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
+from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 
 
 __all__ = [
-    "Magi2ArchitectureConfig",
-    "Magi2DistributedMultiHeadMoE",
-    "Magi2Model",
-    "Magi2Modality",
-    "Magi2MultiHeadMoEConfig",
-    "Magi2MultiHeadTopKRouter",
-    "Magi2ReferenceMultiHeadMoE",
-    "build_magi2_expert_config",
-    "multi_head_topk_routing",
+    "Magi2ForwardStep",
+    "Magi2LatentDataset",
+    "Magi2LatentDatasetConfig",
+    "Magi2ModelProvider",
 ]

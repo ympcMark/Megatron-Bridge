@@ -20,11 +20,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from megatron.core.models.magi2 import Magi2Modality
 from torch.utils.data import Dataset
 
 from megatron.bridge.data.base import DatasetBuildContext, DatasetProvider
-
-from megatron.bridge.diffusion.models.magi2.modeling_magi2.model import Magi2Modality
 
 
 class Magi2LatentDataset(Dataset):
@@ -66,9 +65,7 @@ class Magi2LatentDataset(Dataset):
             dtype=torch.long,
         )
         token_count = modality_mapping.numel()
-        input_width = max(
-            self.video_in_channels, self.audio_in_channels, self.text_in_channels
-        )
+        input_width = max(self.video_in_channels, self.audio_in_channels, self.text_in_channels)
         clean_inputs = torch.zeros(token_count, input_width, dtype=torch.float32)
         video = modality_mapping == Magi2Modality.VIDEO
         audio = modality_mapping == Magi2Modality.AUDIO

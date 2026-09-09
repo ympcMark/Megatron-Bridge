@@ -21,23 +21,17 @@ from collections.abc import Iterable
 from functools import partial
 
 import torch
+from megatron.core.models.magi2 import Magi2Modality, Magi2Model
 from torch import Tensor
 
 from megatron.bridge.training.state import GlobalState
-
-from megatron.bridge.diffusion.models.magi2.modeling_magi2.model import (
-    Magi2Model,
-    Magi2Modality,
-)
 
 
 def magi2_timestep_embedding(timestep: Tensor, width: int) -> Tensor:
     """Create the sinusoidal time embedding consumed as a text-width token."""
     half = width // 2
     frequencies = torch.exp(
-        -math.log(10_000.0)
-        * torch.arange(half, dtype=torch.float32, device=timestep.device)
-        / max(half, 1)
+        -math.log(10_000.0) * torch.arange(half, dtype=torch.float32, device=timestep.device) / max(half, 1)
     )
     angles = timestep.float().reshape(-1, 1) * 1000.0 * frequencies.reshape(1, -1)
     embedding = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
@@ -96,31 +90,30 @@ class Magi2ForwardStep:
         token_timesteps = timesteps.repeat_interleave(sequence_length)
         noise = torch.randn_like(flattened_clean)
         model_inputs = flattened_clean.clone()
-        output_width = max(state.cfg.model.video_in_channels, state.cfg.model.audio_in_channels)
-        target = torch.zeros(
-            flattened_clean.shape[0], output_width, device=clean_inputs.device
+        output_width = max(
+            state.cfg.model.magi2_video_in_channels,
+            state.cfg.model.magi2_audio_in_channels,
         )
+        target = torch.zeros(flattened_clean.shape[0], output_width, device=clean_inputs.device)
         loss_mask = torch.zeros_like(target)
 
         for modality, channels in (
-            (Magi2Modality.VIDEO, state.cfg.model.video_in_channels),
-            (Magi2Modality.AUDIO, state.cfg.model.audio_in_channels),
+            (Magi2Modality.VIDEO, state.cfg.model.magi2_video_in_channels),
+            (Magi2Modality.AUDIO, state.cfg.model.magi2_audio_in_channels),
         ):
             selected = flattened_mapping == modality
             selected_timestep = token_timesteps[selected].unsqueeze(-1)
             clean = flattened_clean[selected, :channels]
             selected_noise = noise[selected, :channels]
-            model_inputs[selected, :channels] = (
-                selected_timestep * clean + (1.0 - selected_timestep) * selected_noise
-            )
+            model_inputs[selected, :channels] = selected_timestep * clean + (1.0 - selected_timestep) * selected_noise
             target[selected, :channels] = clean - selected_noise
             loss_mask[selected, :channels] = 1.0
 
         time_selected = flattened_mapping == Magi2Modality.TIME
         if time_selected.any():
             time_values = token_timesteps[time_selected]
-            model_inputs[time_selected, : state.cfg.model.text_in_channels] = (
-                magi2_timestep_embedding(time_values, state.cfg.model.text_in_channels)
+            model_inputs[time_selected, : state.cfg.model.magi2_text_in_channels] = magi2_timestep_embedding(
+                time_values, state.cfg.model.magi2_text_in_channels
             )
 
         output = model(
