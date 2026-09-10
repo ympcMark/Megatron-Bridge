@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 
 from megatron.core.models.magi2 import (
     Magi2Config,
+    Magi2DotProductAttention,
     Magi2Model,
-    Magi2TorchDotProductAttention,
     Magi2TransformerLayerSpecs,
     get_magi2_layer_specs,
 )
@@ -62,7 +62,7 @@ _ORIGINAL_ARCHITECTURE_FIELDS = (
 
 def default_magi2_layer_specs(_: Magi2Config) -> Magi2TransformerLayerSpecs:
     """Select the correctness-first native MCore MAGI-2 layer specs."""
-    return get_magi2_layer_specs(Magi2TorchDotProductAttention)
+    return get_magi2_layer_specs(Magi2DotProductAttention)
 
 
 def _architecture_mismatches(config: Magi2Config) -> list[str]:
