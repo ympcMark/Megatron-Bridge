@@ -21,7 +21,7 @@ from megatron.bridge.models.qwen_vl.qwen3_vl_step import forward_step, get_batch
 pytestmark = pytest.mark.unit
 
 
-def test_get_batch_from_iterator_rejects_collate_time_packing_metadata():
+def test_get_batch_from_iterator_accepts_collate_time_packing_metadata(monkeypatch):
     batch = {
         "input_ids": torch.tensor([[1, 2, 3]]),
         "position_ids": torch.tensor([[0, 1, 2]]),
@@ -29,12 +29,14 @@ def test_get_batch_from_iterator_rejects_collate_time_packing_metadata():
         "cu_seqlens_q": torch.tensor([0, 3], dtype=torch.int32),
     }
 
-    with pytest.raises(ValueError, match="does not support collate-time in-batch packing"):
-        get_batch_from_iterator(
-            iter([batch]),
-            is_first_pp_stage=True,
-            is_last_pp_stage=True,
-        )
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self, **kwargs: self)
+    result = get_batch_from_iterator(
+        iter([batch]),
+        is_first_pp_stage=True,
+        is_last_pp_stage=True,
+    )
+
+    assert torch.equal(result["cu_seqlens_q"], batch["cu_seqlens_q"])
 
 
 def test_get_batch_from_iterator_allows_deferred_none_packing_metadata(monkeypatch):

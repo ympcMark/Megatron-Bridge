@@ -32,6 +32,11 @@ from megatron.bridge.data.datasets.utils import IGNORE_INDEX
 from megatron.bridge.data.packing.in_batch import build_mcore_thd_sequence_batch_from_rows
 from megatron.bridge.data.token_utils import extract_skipped_token_ids
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
+from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
+    get_vision_cp_data,
+    qwen3vl_cp_split,
+    reorganize_inputs,
+)
 from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 
@@ -91,6 +96,76 @@ def _flatten_grid_thw(grid_thw: torch.Tensor | None) -> torch.Tensor | None:
     if not isinstance(grid_thw, torch.Tensor) or grid_thw.numel() == 0:
         return None
     return grid_thw.reshape(-1, grid_thw.size(-1)).contiguous()
+
+
+def _pre_shard_qwen3_vision_dp_on_cpu(
+    processor: Any,
+    input_ids: torch.Tensor,
+    visual_inputs: GenericVisualInputs,
+    parallel: Mapping[str, int],
+) -> GenericVisualInputs:
+    """Prepare only this rank's Vision-DP patch payload before H2D.
+
+    The global grid is retained for exact FLOP accounting. Local grid and
+    all-rank sequence lengths allow the model to preserve its existing feature
+    AllGather order without copying every rank's pixels to every GPU.
+    """
+    pixel_values = visual_inputs.pixel_values
+    pixel_values_videos = visual_inputs.pixel_values_videos
+    if pixel_values is None and pixel_values_videos is None:
+        return visual_inputs
+    if input_ids.device.type != "cpu":
+        raise ValueError("Vision-DP collate pre-sharding expects CPU input_ids")
+
+    global_vision_data, global_grid_thw, _ = reorganize_inputs(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=_flatten_grid_thw(visual_inputs.image_grid_thw),
+        video_grid_thw=_flatten_grid_thw(visual_inputs.video_grid_thw),
+        image_token_id=_resolve_qwen_special_token_id(processor, "image_token_id"),
+        video_token_id=_resolve_qwen_special_token_id(processor, "video_token_id"),
+        square_merge_size=_qwen_spatial_merge_size(processor) ** 2,
+    )
+    if global_grid_thw is None or global_grid_thw.numel() == 0:
+        return visual_inputs
+
+    tp_size = int(parallel["tp_size"])
+    tp_rank = int(parallel["tp_rank"])
+    cp_size = int(parallel["cp_size"])
+    cp_rank = int(parallel["cp_rank"])
+    use_tp_cp = global_grid_thw.shape[0] >= tp_size * cp_size
+    vision_dp_size = tp_size * cp_size if use_tp_cp else cp_size
+    vision_dp_rank = cp_rank * tp_size + tp_rank if use_tp_cp else cp_rank
+    if vision_dp_size <= 1:
+        return visual_inputs
+
+    split_data, split_grid, image_counts, images_padded = qwen3vl_cp_split(
+        vision_dp_size,
+        global_vision_data,
+        global_grid_thw,
+    )
+    local_data, local_grid, seqlens_by_rank = get_vision_cp_data(
+        split_data,
+        split_grid,
+        _qwen_spatial_merge_size(processor) ** 2,
+        image_counts,
+        images_padded,
+        vision_dp_rank,
+        vision_dp_size,
+    )
+    max_images = max(seqlens.numel() for seqlens in seqlens_by_rank)
+    padded_seqlens = torch.stack(
+        [F.pad(seqlens, (0, max_images - seqlens.numel())) for seqlens in seqlens_by_rank]
+    ).contiguous()
+
+    return GenericVisualInputs(
+        pixel_values=local_data.contiguous(),
+        # Keep the small global grid so throughput FLOP accounting is unchanged.
+        image_grid_thw=global_grid_thw.contiguous(),
+        vision_dp_local_grid_thw=local_grid.contiguous(),
+        vision_dp_seqlens=padded_seqlens,
+    )
 
 
 def _build_cpu_mrope_position_ids(
@@ -213,6 +288,9 @@ def qwen2_5_collate_fn(
     pad_to_multiple_of: int = 128,
     enable_in_batch_packing: bool = False,
     in_batch_packing_pad_to_multiple_of: int = 1,
+    in_batch_packing_attention_on_padding: bool = False,
+    precompute_mrope_position_ids: bool = True,
+    vision_dp_cpu_pre_shard: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Collate function for Qwen2.5 VL model."""
     del visual_keys
@@ -290,13 +368,16 @@ def qwen2_5_collate_fn(
                     attention_mask = torch.ones_like(input_ids)
                 else:
                     attention_mask = attention_mask[0]
-                position_ids = _build_cpu_mrope_position_ids(
-                    processor,
-                    input_ids,
-                    attention_mask,
-                    sample_batch.get("image_grid_thw"),
-                    sample_batch.get("video_grid_thw"),
-                )
+                if precompute_mrope_position_ids:
+                    position_ids = _build_cpu_mrope_position_ids(
+                        processor,
+                        input_ids,
+                        attention_mask,
+                        sample_batch.get("image_grid_thw"),
+                        sample_batch.get("video_grid_thw"),
+                    )
+                else:
+                    position_ids = torch.arange(input_ids.numel(), device=input_ids.device, dtype=torch.long)
 
                 loss_mask = build_assistant_loss_mask(
                     example,
@@ -339,6 +420,13 @@ def qwen2_5_collate_fn(
             ignore_index=IGNORE_INDEX,
             pad_to_multiple_of=in_batch_packing_pad_to_multiple_of,
         )
+        if in_batch_packing_attention_on_padding and packed_batch.get("cu_seqlens_q_padded") is not None:
+            # Treat per-sequence alignment slots as ordinary causal-attention
+            # positions while keeping their labels/loss masked. FlashAttention
+            # then sees contiguous THD sequences rather than unsupported
+            # padding gaps between sequences.
+            packed_batch["cu_seqlens_q"] = packed_batch.pop("cu_seqlens_q_padded")
+            packed_batch["cu_seqlens_kv"] = packed_batch.pop("cu_seqlens_kv_padded")
         packed_batch["visual_inputs"] = GenericVisualInputs(
             **{key: torch.cat(values, dim=0) for key, values in visual_values.items() if values}
         )
@@ -426,15 +514,25 @@ def qwen2_5_collate_fn(
             if key in batch_with:
                 batch[key] = batch_with[key]
 
-    batch["position_ids"] = _build_cpu_mrope_batch(
-        processor,
-        batch["input_ids"],
-        batch.get("attention_mask"),
-        batch.get("image_grid_thw"),
-        batch.get("video_grid_thw"),
-        [len(images) for images in per_example_images],
-        [len(videos) for videos in per_example_videos],
-    )
+    if precompute_mrope_position_ids:
+        batch["position_ids"] = _build_cpu_mrope_batch(
+            processor,
+            batch["input_ids"],
+            batch.get("attention_mask"),
+            batch.get("image_grid_thw"),
+            batch.get("video_grid_thw"),
+            [len(images) for images in per_example_images],
+            [len(videos) for videos in per_example_videos],
+        )
+    else:
+        batch_size, seq_len = batch["input_ids"].shape
+        batch["position_ids"] = (
+            torch.arange(seq_len, device=batch["input_ids"].device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .clone()
+            .contiguous()
+        )
 
     loss_mask = torch.stack(
         [
@@ -464,6 +562,13 @@ def qwen2_5_collate_fn(
         video_grid_thw=batch.get("video_grid_thw"),
         second_per_grid_ts=batch.get("second_per_grid_ts"),
     )
+    if vision_dp_cpu_pre_shard is not None:
+        visual_inputs = _pre_shard_qwen3_vision_dp_on_cpu(
+            processor,
+            batch["input_ids"],
+            visual_inputs,
+            vision_dp_cpu_pre_shard,
+        )
     for key in QWEN_VISUAL_KEYS:
         batch.pop(key, None)
     batch["visual_inputs"] = visual_inputs

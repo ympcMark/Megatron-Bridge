@@ -1185,7 +1185,10 @@ class ConfigContainer(Container):
         if enable_in_batch_packing:
             self.model._enable_in_batch_packing = True
             if hasattr(self.dataset, "in_batch_packing_pad_to_multiple_of"):
-                self.dataset.in_batch_packing_pad_to_multiple_of = collate_padding_multiple
+                self.dataset.in_batch_packing_pad_to_multiple_of = math.lcm(
+                    self.dataset.in_batch_packing_pad_to_multiple_of,
+                    collate_padding_multiple,
+                )
         elif isinstance(
             self.dataset,
             (DirectHFSFTDatasetConfig, EnergonDatasetConfig, MockVLMSFTDatasetConfig),

@@ -80,9 +80,16 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
     pad_to_max_length: bool = False
     pad_to_multiple_of: int = 128
     in_batch_packing_pad_to_multiple_of: int = 1
+    in_batch_packing_attention_on_padding: bool = False
     cache_path: str | None = None
     cache_micro_batch_size: int | None = None
     online_mock: bool = False
+    online_mock_samples_per_pack: int = 1
+    precompute_mrope_position_ids: bool = True
+    pre_shard_vision_dp_on_cpu: bool = False
+    async_h2d_prefetch: bool = False
+    single_producer_tp_cp: bool = False
+    coalesce_tp_cp_batch_broadcast: bool = False
 
     def validate(self) -> None:
         """Validate synthetic data settings."""
@@ -108,6 +115,17 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
             raise ValueError("cache_micro_batch_size must be positive when cache_path is set.")
         if self.online_mock and self.cache_path is not None:
             raise ValueError("online_mock and cache_path are mutually exclusive.")
+        if self.online_mock_samples_per_pack <= 0:
+            raise ValueError("online_mock_samples_per_pack must be greater than 0.")
+        if self.online_mock_samples_per_pack > 1:
+            if not self.online_mock:
+                raise ValueError("online_mock_samples_per_pack > 1 requires online_mock=True.")
+            if not self.enable_in_batch_packing or self.defer_in_batch_packing_to_step:
+                raise ValueError(
+                    "online_mock_samples_per_pack > 1 requires collate-time in-batch packing."
+                )
+            if self.seq_length % self.online_mock_samples_per_pack != 0:
+                raise ValueError("seq_length must be divisible by online_mock_samples_per_pack.")
 
     def finalize(self) -> None:
         """Finalize dataloader settings and validate this config."""
@@ -188,7 +206,14 @@ def make_online_mock_vlm_example(config: MockVLMSFTDatasetConfig, index: int) ->
         images_per_unit = max(1, config.num_images)
         image_tokens_per_unit = images_per_unit * image_tokens_per_image
         words_per_unit = max(1, math.ceil(image_tokens_per_unit * config.ratio))
-        repeats = max(1, math.ceil(config.seq_length / (image_tokens_per_unit + words_per_unit)))
+        sample_target_length = config.seq_length // config.online_mock_samples_per_pack
+        if config.online_mock_samples_per_pack > 1:
+            # Leave the remainder for the chat template and special tokens. The
+            # collator aligns every logical sample to sample_target_length, so
+            # one model microbatch remains exactly config.seq_length tokens.
+            repeats = max(1, sample_target_length // (image_tokens_per_unit + words_per_unit))
+        else:
+            repeats = max(1, math.ceil(sample_target_length / (image_tokens_per_unit + words_per_unit)))
         response_length = words_per_unit * repeats
         num_images = images_per_unit * repeats
 
@@ -208,6 +233,7 @@ class OnlineMockVLMSFTDataset(DirectSFTDataset):
         config: MockVLMSFTDatasetConfig,
         target_length: int,
         processor: Any,
+        vision_dp_cpu_pre_shard: dict[str, int] | None = None,
     ) -> None:
         # DirectSFTDataset owns the canonical processor-aware collate binding. The
         # placeholder is never returned because __getitem__ is overridden below.
@@ -222,6 +248,9 @@ class OnlineMockVLMSFTDataset(DirectSFTDataset):
             enable_in_batch_packing=config.enable_in_batch_packing,
             defer_in_batch_packing_to_step=config.defer_in_batch_packing_to_step,
             in_batch_packing_pad_to_multiple_of=config.in_batch_packing_pad_to_multiple_of,
+            in_batch_packing_attention_on_padding=config.in_batch_packing_attention_on_padding,
+            precompute_mrope_position_ids=config.precompute_mrope_position_ids,
+            vision_dp_cpu_pre_shard=vision_dp_cpu_pre_shard,
         )
         self._mock_config = config
 
@@ -251,6 +280,8 @@ def build_mock_vlm_sft_split(
         enable_in_batch_packing=config.enable_in_batch_packing,
         defer_in_batch_packing_to_step=config.defer_in_batch_packing_to_step,
         in_batch_packing_pad_to_multiple_of=config.in_batch_packing_pad_to_multiple_of,
+        in_batch_packing_attention_on_padding=config.in_batch_packing_attention_on_padding,
+        precompute_mrope_position_ids=config.precompute_mrope_position_ids,
     )
 
 
@@ -258,11 +289,17 @@ def build_online_mock_vlm_sft_split(
     config: MockVLMSFTDatasetConfig,
     target_length: int,
     processor: Any,
+    vision_dp_cpu_pre_shard: dict[str, int] | None = None,
 ) -> OnlineMockVLMSFTDataset | None:
     """Build a split whose raw examples and collated tensors are produced online."""
     if target_length <= 0:
         return None
-    return OnlineMockVLMSFTDataset(config=config, target_length=target_length, processor=processor)
+    return OnlineMockVLMSFTDataset(
+        config=config,
+        target_length=target_length,
+        processor=processor,
+        vision_dp_cpu_pre_shard=vision_dp_cpu_pre_shard,
+    )
 
 
 class MockVLMSFTDatasetBuilder:
@@ -322,10 +359,26 @@ class MockVLMSFTDatasetBuilder:
             ),
         )
         if self.config.online_mock:
+            vision_dp_cpu_pre_shard = None
+            if self.config.pre_shard_vision_dp_on_cpu:
+                if context.pg_collection is None:
+                    raise ValueError("CPU vision-DP pre-sharding requires process-group metadata")
+                vision_dp_cpu_pre_shard = {
+                    "tp_size": context.pg_collection.tp.size(),
+                    "tp_rank": context.pg_collection.tp.rank(),
+                    "cp_size": context.pg_collection.cp.size(),
+                    "cp_rank": context.pg_collection.cp.rank(),
+                }
             return (
-                build_online_mock_vlm_sft_split(self.config, context.train_samples, processor),
-                build_online_mock_vlm_sft_split(self.config, context.valid_samples, processor),
-                build_online_mock_vlm_sft_split(self.config, context.test_samples, processor),
+                build_online_mock_vlm_sft_split(
+                    self.config, context.train_samples, processor, vision_dp_cpu_pre_shard
+                ),
+                build_online_mock_vlm_sft_split(
+                    self.config, context.valid_samples, processor, vision_dp_cpu_pre_shard
+                ),
+                build_online_mock_vlm_sft_split(
+                    self.config, context.test_samples, processor, vision_dp_cpu_pre_shard
+                ),
             )
         base_examples = make_mock_vlm_examples(self.config)
         return (

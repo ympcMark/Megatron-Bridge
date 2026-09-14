@@ -82,6 +82,26 @@ def test_ratio_controls_text_and_image_repetition():
     assert len(response.split()) == 86
 
 
+def test_online_ratio_shortens_each_sample_for_collate_time_pack():
+    config = _config(
+        seq_length=128,
+        ratio=2.0,
+        num_images=1,
+        image_size=(16, 16),
+        online_mock=True,
+        online_mock_samples_per_pack=2,
+        enable_in_batch_packing=True,
+    )
+
+    example = builder_module.make_online_mock_vlm_example(config, 0)
+    user_content = example["conversation"][0]["content"]
+    response = example["conversation"][1]["content"][0]["text"]
+
+    # A 64-token logical slot holds floor(64 / (1 image + 2 words)) units.
+    assert sum(part["type"] == "image" for part in user_content) == 21
+    assert len(response.split()) == 42
+
+
 def test_builder_loads_fully_collated_cache_without_processor(tmp_path):
     cache_path = tmp_path / "mock.pt"
     metadata = {

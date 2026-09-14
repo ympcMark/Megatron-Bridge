@@ -416,6 +416,8 @@ class Qwen3VLModel(MegatronModule):
         video_input_mask: torch.Tensor = None,
         cp_img_num: list[int] = None,
         images_padded: list[bool] = None,
+        vision_dp_local_grid_thw: torch.Tensor = None,
+        vision_dp_seqlens: torch.Tensor = None,
         inference_context: object | None = None,
         runtime_gather_output: bool | None = None,
         mm_token_type_ids: torch.Tensor = None,
@@ -489,33 +491,49 @@ class Qwen3VLModel(MegatronModule):
 
         if self.pre_process:
             # can reorganize_inputs at dataset
-            vision_data, vision_grid_thw, vision_mask = reorganize_inputs(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                image_input_mask=image_input_mask,
-                video_input_mask=video_input_mask,
-                image_token_id=self.image_token_id,
-                video_token_id=self.video_token_id,
-                square_merge_size=self.square_merge_size,
-            )
+            vision_dp_pre_sharded = vision_dp_seqlens is not None
+            if vision_dp_pre_sharded:
+                if pixel_values is None or vision_dp_local_grid_thw is None:
+                    raise ValueError("Incomplete CPU-pre-sharded Vision-DP payload")
+                vision_data = pixel_values
+                vision_grid_thw = vision_dp_local_grid_thw
+                # Collation happens before fixed-length truncation. Rebuild the
+                # mask from the final model input so its sequence dimension is
+                # always aligned for both image and video tokens.
+                vision_mask = (input_ids == self.image_token_id) | (input_ids == self.video_token_id)
+            else:
+                vision_data, vision_grid_thw, vision_mask = reorganize_inputs(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    image_input_mask=image_input_mask,
+                    video_input_mask=video_input_mask,
+                    image_token_id=self.image_token_id,
+                    video_token_id=self.video_token_id,
+                    square_merge_size=self.square_merge_size,
+                )
 
             vision_embeds = None
 
             if vision_grid_thw is not None and vision_grid_thw.shape[0] > 0:
-                use_tp_cp_vision_dp = (
-                    self.vision_dp_over_tp_cp
-                    and vision_grid_thw.shape[0] >= cp_size * tp_size
+                use_tp_cp_vision_dp = self.vision_dp_over_tp_cp and (
+                    vision_dp_seqlens.shape[0] == cp_size * tp_size
+                    if vision_dp_pre_sharded
+                    else vision_grid_thw.shape[0] >= cp_size * tp_size
                 )
-                vision_dp_size = cp_size * tp_size if use_tp_cp_vision_dp else cp_size
+                vision_dp_size = vision_dp_seqlens.shape[0] if vision_dp_pre_sharded else (
+                    cp_size * tp_size if use_tp_cp_vision_dp else cp_size
+                )
                 vision_dp_rank = cp_rank * tp_size + tp_rank if use_tp_cp_vision_dp else cp_rank
                 use_vision_data_parallel = self.config.vision_dp_when_cp and vision_dp_size > 1
                 vision_tp_gather_seqlens = None
                 seqlen_on_cp_ranks = None
                 if use_vision_data_parallel:
-                    if cp_img_num is None:
+                    if vision_dp_pre_sharded:
+                        seqlen_on_vision_ranks = list(vision_dp_seqlens.unbind(0))
+                    elif cp_img_num is None:
                         assert images_padded is None
                         vision_data, vision_grid_thw, cp_img_num, images_padded = qwen3vl_cp_split(
                             vision_dp_size,
@@ -526,15 +544,16 @@ class Qwen3VLModel(MegatronModule):
                         raise ValueError(
                             "precomputed cp_img_num is incompatible with vision_dp_over_tp_cp"
                         )
-                    vision_data, vision_grid_thw, seqlen_on_vision_ranks = get_vision_cp_data(
-                        vision_data,
-                        vision_grid_thw,
-                        self.square_merge_size,
-                        cp_img_num,
-                        images_padded,
-                        vision_dp_rank,
-                        vision_dp_size,
-                    )
+                    if not vision_dp_pre_sharded:
+                        vision_data, vision_grid_thw, seqlen_on_vision_ranks = get_vision_cp_data(
+                            vision_data,
+                            vision_grid_thw,
+                            self.square_merge_size,
+                            cp_img_num,
+                            images_padded,
+                            vision_dp_rank,
+                            vision_dp_size,
+                        )
                     if use_tp_cp_vision_dp:
                         tp_begin = cp_rank * tp_size
                         tp_end = tp_begin + tp_size

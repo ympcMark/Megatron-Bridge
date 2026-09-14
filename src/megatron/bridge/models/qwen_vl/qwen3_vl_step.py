@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import math
+from dataclasses import fields
 from functools import partial
 from typing import Any, Iterable
 
@@ -34,9 +35,246 @@ from megatron.bridge.training.utils.padding_utils import (
     pad_or_truncate_pos_to_len,
 )
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
+from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
 
 
 logger = logging.getLogger(__name__)
+
+
+def _move_required_batch_to_cuda(
+    batch: dict[str, Any],
+    *,
+    skip_getting_attention_mask_from_dataset: bool,
+    is_last_pp_stage: bool,
+) -> dict[str, Any]:
+    """Project a CPU batch to the required fields and enqueue non-blocking H2D."""
+    required_device_keys = {
+        "visual_inputs",
+        "tokens",
+        "input_ids",
+        "position_ids",
+        "cu_seqlens_q",
+        "cu_seqlens_kv",
+        "cu_seqlens_q_padded",
+        "cu_seqlens_kv_padded",
+        "max_seqlen_q",
+        "max_seqlen_kv",
+    }
+    if not skip_getting_attention_mask_from_dataset:
+        required_device_keys.add("attention_mask")
+    if is_last_pp_stage:
+        required_device_keys.update(("labels", "loss_mask"))
+
+    device_batch: dict[str, Any] = {}
+    for key, val in batch.items():
+        if key not in required_device_keys:
+            device_batch[key] = None
+        elif key == "visual_inputs":
+            if val is None:
+                device_batch[key] = None
+            else:
+                device_batch[key] = val
+                for field, tensor in val.__dict__.items():
+                    val.__dict__[field] = tensor.cuda(non_blocking=True) if tensor is not None else None
+        else:
+            device_batch[key] = val.cuda(non_blocking=True) if val is not None else None
+    return device_batch
+
+
+def _record_batch_stream(batch: dict[str, Any], stream: torch.cuda.Stream) -> None:
+    """Keep side-stream allocations alive through their default-stream consumers."""
+    for value in batch.values():
+        if isinstance(value, torch.Tensor):
+            value.record_stream(stream)
+        elif value is not None and hasattr(value, "__dict__"):
+            for tensor in value.__dict__.values():
+                if isinstance(tensor, torch.Tensor):
+                    tensor.record_stream(stream)
+
+
+class _AsyncH2DBatchPrefetcher:
+    """One-batch CUDA side-stream prefetcher for an already-prefetched CPU iterator."""
+
+    def __init__(
+        self,
+        data_iterator: Iterable,
+        *,
+        skip_getting_attention_mask_from_dataset: bool,
+        is_last_pp_stage: bool,
+    ) -> None:
+        self.data_iterator = data_iterator
+        self.skip_attention_mask = skip_getting_attention_mask_from_dataset
+        self.is_last_pp_stage = is_last_pp_stage
+        self.stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self.batch: dict[str, Any] | None = None
+        self.ready_event: torch.cuda.Event | None = None
+        self._enqueue_next()
+
+    def _enqueue_next(self) -> None:
+        try:
+            cpu_batch = next(self.data_iterator)
+        except StopIteration:
+            self.batch = None
+            self.ready_event = None
+            return
+        with torch.cuda.stream(self.stream):
+            self.batch = _move_required_batch_to_cuda(
+                cpu_batch,
+                skip_getting_attention_mask_from_dataset=self.skip_attention_mask,
+                is_last_pp_stage=self.is_last_pp_stage,
+            )
+            self.ready_event = torch.cuda.Event()
+            self.ready_event.record(self.stream)
+
+    def next(self) -> dict[str, Any]:
+        if self.batch is None or self.ready_event is None:
+            raise StopIteration
+        current_batch = self.batch
+        current_event = self.ready_event
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(current_event)
+        _record_batch_stream(current_batch, current_stream)
+        self._enqueue_next()
+        return current_batch
+
+
+_ASYNC_H2D_PREFETCHERS: dict[int, _AsyncH2DBatchPrefetcher] = {}
+
+_BATCH_BROADCAST_KEYS = (
+    "tokens",
+    "input_ids",
+    "labels",
+    "loss_mask",
+    "attention_mask",
+    "position_ids",
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+    "max_seqlen_q",
+    "max_seqlen_kv",
+)
+_VISUAL_BROADCAST_KEYS = tuple(field.name for field in fields(GenericVisualInputs))
+_BROADCAST_DTYPES = (
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
+_DTYPE_TO_ID = {dtype: index for index, dtype in enumerate(_BROADCAST_DTYPES)}
+_BROADCAST_MAX_DIMS = 6
+
+
+def _flatten_broadcast_batch(batch: dict[str, Any]) -> list[torch.Tensor | None]:
+    tensors = [batch.get(key) for key in _BATCH_BROADCAST_KEYS]
+    visual_inputs = batch.get("visual_inputs")
+    tensors.extend(
+        getattr(visual_inputs, key, None) if visual_inputs is not None else None
+        for key in _VISUAL_BROADCAST_KEYS
+    )
+    return tensors
+
+
+def _unflatten_broadcast_batch(tensors: list[torch.Tensor | None]) -> dict[str, Any]:
+    split = len(_BATCH_BROADCAST_KEYS)
+    batch = dict(zip(_BATCH_BROADCAST_KEYS, tensors[:split]))
+    visual_values = dict(zip(_VISUAL_BROADCAST_KEYS, tensors[split:]))
+    batch["visual_inputs"] = (
+        GenericVisualInputs(**visual_values) if any(value is not None for value in visual_values.values()) else None
+    )
+    return batch
+
+
+def _broadcast_tp_cp_batch(
+    data_iterator: Iterable,
+    pg_collection,
+    *,
+    skip_getting_attention_mask_from_dataset: bool,
+    is_last_pp_stage: bool,
+    coalesce_payloads: bool,
+) -> dict[str, Any]:
+    """Load one batch on TPxCP rank 0 and broadcast its dynamic tensor schema/payload."""
+    group = pg_collection.tp_cp
+    group_ranks = torch.distributed.get_process_group_ranks(group)
+    src_global_rank = group_ranks[0]
+    is_source = torch.distributed.get_rank() == src_global_rank
+    num_fields = len(_BATCH_BROADCAST_KEYS) + len(_VISUAL_BROADCAST_KEYS)
+    header_width = 3 + _BROADCAST_MAX_DIMS
+
+    if is_source:
+        cpu_batch = next(data_iterator)
+        source_batch = _move_required_batch_to_cuda(
+            cpu_batch,
+            skip_getting_attention_mask_from_dataset=skip_getting_attention_mask_from_dataset,
+            is_last_pp_stage=is_last_pp_stage,
+        )
+        tensors = _flatten_broadcast_batch(source_batch)
+        header_rows = []
+        for tensor in tensors:
+            if tensor is None:
+                header_rows.append([0] * header_width)
+                continue
+            if tensor.dtype not in _DTYPE_TO_ID:
+                raise TypeError(f"Unsupported batch-broadcast dtype: {tensor.dtype}")
+            if tensor.dim() > _BROADCAST_MAX_DIMS:
+                raise ValueError(f"Batch-broadcast tensor has too many dimensions: {tensor.shape}")
+            dims = list(tensor.shape) + [0] * (_BROADCAST_MAX_DIMS - tensor.dim())
+            header_rows.append([1, _DTYPE_TO_ID[tensor.dtype], tensor.dim(), *dims])
+        header = torch.tensor(header_rows, dtype=torch.int64, device=torch.cuda.current_device())
+    else:
+        tensors = [None] * num_fields
+        header = torch.empty((num_fields, header_width), dtype=torch.int64, device=torch.cuda.current_device())
+
+    torch.distributed.broadcast(header, src=src_global_rank, group=group)
+    if not is_source:
+        header_rows = header.tolist()
+        tensors = []
+        for present, dtype_id, ndim, *dims in header_rows:
+            if not present:
+                tensors.append(None)
+                continue
+            shape = tuple(dims[:ndim])
+            tensors.append(
+                torch.empty(shape, dtype=_BROADCAST_DTYPES[dtype_id], device=torch.cuda.current_device())
+            )
+
+    if coalesce_payloads:
+        # Dynamic shapes are described by the header above. Grouping payloads by
+        # dtype reduces one collective launch per tensor to one per dtype while
+        # preserving the original tensor shapes as views of the received buffer.
+        source_tensors = tensors
+        received_tensors: list[torch.Tensor | None] = [None] * num_fields
+        for dtype in _BROADCAST_DTYPES:
+            indices = [
+                index for index, tensor in enumerate(tensors) if tensor is not None and tensor.dtype == dtype
+            ]
+            if not indices:
+                continue
+            numels = [tensors[index].numel() for index in indices]
+            if is_source:
+                if len(indices) == 1:
+                    packed = tensors[indices[0]].reshape(-1)
+                else:
+                    packed = torch.cat([tensors[index].reshape(-1) for index in indices])
+            else:
+                packed = torch.empty(sum(numels), dtype=dtype, device=torch.cuda.current_device())
+            torch.distributed.broadcast(packed, src=src_global_rank, group=group)
+            offset = 0
+            for index, numel in zip(indices, numels):
+                received_tensors[index] = packed.narrow(0, offset, numel).view(tensors[index].shape)
+                offset += numel
+        tensors = source_tensors if is_source else received_tensors
+    else:
+        for tensor in tensors:
+            if tensor is not None:
+                torch.distributed.broadcast(tensor, src=src_global_rank, group=group)
+    return _unflatten_broadcast_batch(tensors)
 
 
 def get_batch_from_iterator(
@@ -46,6 +284,10 @@ def get_batch_from_iterator(
     *,
     is_first_pp_stage: bool,
     is_last_pp_stage: bool,
+    async_h2d_prefetch: bool = False,
+    single_producer_tp_cp: bool = False,
+    coalesce_tp_cp_batch_broadcast: bool = False,
+    pg_collection=None,
 ) -> dict[str, Any]:
     """Get a batch of data from the iterator.
 
@@ -57,45 +299,35 @@ def get_batch_from_iterator(
     Returns:
         dict[str, torch.Tensor]: A dictionary containing the batch data.
     """
-    batch = next(data_iterator)
-    if batch.get("cu_seqlens_q") is not None or batch.get("cu_seqlens") is not None:
-        raise ValueError(
-            "qwen3_vl_step does not support collate-time in-batch packing. "
-            "Use an unpacked collate batch with this step so it can build Qwen3-VL packed sequence metadata itself."
+    if single_producer_tp_cp:
+        if pg_collection is None:
+            raise ValueError("single_producer_tp_cp requires the model process groups")
+        return _broadcast_tp_cp_batch(
+            data_iterator,
+            pg_collection,
+            skip_getting_attention_mask_from_dataset=skip_getting_attention_mask_from_dataset,
+            is_last_pp_stage=is_last_pp_stage,
+            coalesce_payloads=coalesce_tp_cp_batch_broadcast,
         )
 
-    required_device_keys = set()
-    required_host_keys = set()
+    if async_h2d_prefetch:
+        key = id(data_iterator)
+        prefetcher = _ASYNC_H2D_PREFETCHERS.get(key)
+        if prefetcher is None or prefetcher.data_iterator is not data_iterator:
+            prefetcher = _AsyncH2DBatchPrefetcher(
+                data_iterator,
+                skip_getting_attention_mask_from_dataset=skip_getting_attention_mask_from_dataset,
+                is_last_pp_stage=is_last_pp_stage,
+            )
+            _ASYNC_H2D_PREFETCHERS[key] = prefetcher
+        return prefetcher.next()
 
-    if not skip_getting_attention_mask_from_dataset:
-        required_device_keys.add("attention_mask")
-
-    # Instead of raw tensors, expect a single 'visual_inputs' object in batch
-    required_device_keys.add("visual_inputs")
-
-    required_device_keys.update(("tokens", "input_ids", "position_ids"))
-    if is_last_pp_stage:
-        required_device_keys.update(("labels", "loss_mask"))
-
-    _batch_required_keys = {}
-    for key, val in batch.items():
-        if key in required_device_keys:
-            if key == "visual_inputs":
-                if val is None:
-                    _batch_required_keys[key] = None
-                else:
-                    _batch_required_keys[key] = val
-                    # Move all visual inputs contained tensors to CUDA
-                    for k, v in val.__dict__.items():
-                        _batch_required_keys[key].__dict__[k] = v.cuda(non_blocking=True) if v is not None else None
-            else:
-                _batch_required_keys[key] = val.cuda(non_blocking=True) if val is not None else None
-        elif key in required_host_keys:
-            _batch_required_keys[key] = val.cpu() if val is not None else None
-        else:
-            _batch_required_keys[key] = None
-
-    return _batch_required_keys
+    batch = next(data_iterator)
+    return _move_required_batch_to_cuda(
+        batch,
+        skip_getting_attention_mask_from_dataset=skip_getting_attention_mask_from_dataset,
+        is_last_pp_stage=is_last_pp_stage,
+    )
 
 
 def get_batch(
@@ -105,6 +337,7 @@ def get_batch(
     *,
     is_first_pp_stage: bool,
     is_last_pp_stage: bool,
+    pg_collection=None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -112,6 +345,7 @@ def get_batch(
     torch.Tensor,
     torch.Tensor,
     Any,
+    PackedSeqParams | None,
 ]:
     """Generate a batch.
 
@@ -132,6 +366,10 @@ def get_batch(
         getattr(cfg.dataset, "skip_getting_attention_mask_from_dataset", True),
         is_first_pp_stage=is_first_pp_stage,
         is_last_pp_stage=is_last_pp_stage,
+        async_h2d_prefetch=getattr(cfg.dataset, "async_h2d_prefetch", False),
+        single_producer_tp_cp=getattr(cfg.dataset, "single_producer_tp_cp", False),
+        coalesce_tp_cp_batch_broadcast=getattr(cfg.dataset, "coalesce_tp_cp_batch_broadcast", False),
+        pg_collection=pg_collection,
     )
 
     if "visual_inputs" in batch and batch.get("visual_inputs") is not None:
@@ -141,7 +379,27 @@ def get_batch(
     else:
         multi_modal_inputs = {}
 
-    # return naive batch and don't do any padding or cp slicing
+    packed_seq_params = None
+    if batch.get("cu_seqlens_q") is not None:
+        cu_seqlens_q = batch["cu_seqlens_q"]
+        cu_seqlens_kv = batch.get("cu_seqlens_kv")
+        if cu_seqlens_kv is None:
+            cu_seqlens_kv = cu_seqlens_q
+        max_seqlen_q = batch.get("max_seqlen_q")
+        max_seqlen_kv = batch.get("max_seqlen_kv")
+        max_seqlen_q = int(max_seqlen_q.item()) if isinstance(max_seqlen_q, torch.Tensor) else int(max_seqlen_q)
+        max_seqlen_kv = int(max_seqlen_kv.item()) if isinstance(max_seqlen_kv, torch.Tensor) else int(max_seqlen_kv)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_kv=max_seqlen_kv,
+            cu_seqlens_q_padded=batch.get("cu_seqlens_q_padded"),
+            cu_seqlens_kv_padded=batch.get("cu_seqlens_kv_padded"),
+        )
+
+    # Return the original model inputs plus optional collate-owned THD boundaries.
     return (
         batch.get("tokens") if batch.get("tokens") is not None else batch.get("input_ids"),
         batch.get("labels"),
@@ -149,6 +407,7 @@ def get_batch(
         batch.get("attention_mask"),
         batch.get("position_ids"),
         multi_modal_inputs,
+        packed_seq_params,
     )
 
 
@@ -239,6 +498,18 @@ def forward_step(
 
     timers("batch-generator", log_level=2).start()
     with straggler_timer(bdata=True):
+        batch_values = get_batch(
+            data_iterator,
+            state.cfg,
+            use_mtp,
+            is_first_pp_stage=is_first,
+            is_last_pp_stage=is_last,
+            pg_collection=this_pg_collection,
+        )
+        # Keep compatibility with custom/test batch providers that implement
+        # the historical six-value Qwen3-VL step contract.
+        if len(batch_values) == 6:
+            batch_values = (*batch_values, None)
         (
             tokens,
             labels,
@@ -246,24 +517,30 @@ def forward_step(
             attention_mask,
             position_ids,
             multi_modal_inputs,
-        ) = get_batch(data_iterator, state.cfg, use_mtp, is_first_pp_stage=is_first, is_last_pp_stage=is_last)
+            collate_packed_seq_params,
+        ) = batch_values
     timers("batch-generator").stop()
 
     # Qwen3-VL keeps sequence preparation in the step because model.forward
     # needs the original input IDs before doing model-specific CP/SP handling.
     enable_in_batch_packing = getattr(state.cfg.dataset, "enable_in_batch_packing", False)
 
-    tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = _pad_and_pack_qwen3_vl_step(
-        tokens,
-        labels,
-        loss_mask,
-        attention_mask,
-        position_ids,
-        this_pg_collection,
-        use_fp8_padding=True,
-        force_to_pad_to_seq_len=this_pg_collection.pp.size() > 1 or this_pg_collection.ep.size() > 1,
-        seq_length=config.seq_length,
-    )
+    if collate_packed_seq_params is None:
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = _pad_and_pack_qwen3_vl_step(
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            this_pg_collection,
+            use_fp8_padding=True,
+            force_to_pad_to_seq_len=this_pg_collection.pp.size() > 1 or this_pg_collection.ep.size() > 1,
+            seq_length=config.seq_length,
+        )
+    else:
+        if tokens.dim() != 2 or tokens.size(0) != 1:
+            raise ValueError("Collate-time Qwen3-VL packing requires a single THD token row.")
+        packed_seq_params = collate_packed_seq_params
 
     # Accumulate FLOPS metadata across micro-batches. When in-batch packing is
     # active, ``packed_seq_params.cu_seqlens_q`` describes the real sub-seq
@@ -310,11 +587,12 @@ def forward_step(
 
     original_tokens = tokens.clone()
     explicit_mrope_position_ids = position_ids if position_ids is not None and position_ids.dim() == 3 else None
-    forward_args = get_batch_on_this_cp_rank(
-        forward_args,
-        is_hybrid_cp=False,
-        cp_group=this_pg_collection.cp,
-    )
+    if collate_packed_seq_params is None:
+        forward_args = get_batch_on_this_cp_rank(
+            forward_args,
+            is_hybrid_cp=False,
+            cp_group=this_pg_collection.cp,
+        )
     forward_args["packed_seq_params"] = None
     forward_args["input_ids"] = original_tokens
     # Explicit 3D M-RoPE IDs are collated on CPU and sliced by model.forward.
@@ -345,6 +623,10 @@ def forward_step(
         forward_args["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"]
     if "video_grid_thw" in multi_modal_inputs:
         forward_args["video_grid_thw"] = multi_modal_inputs["video_grid_thw"]
+    if "vision_dp_local_grid_thw" in multi_modal_inputs:
+        forward_args["vision_dp_local_grid_thw"] = multi_modal_inputs["vision_dp_local_grid_thw"]
+    if "vision_dp_seqlens" in multi_modal_inputs:
+        forward_args["vision_dp_seqlens"] = multi_modal_inputs["vision_dp_seqlens"]
 
     check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
     check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss

@@ -68,6 +68,9 @@ class DirectSFTDataset(torch.utils.data.Dataset):
         enable_in_batch_packing: bool = False,
         defer_in_batch_packing_to_step: bool = False,
         in_batch_packing_pad_to_multiple_of: int = 1,
+        in_batch_packing_attention_on_padding: bool = False,
+        precompute_mrope_position_ids: bool | None = None,
+        vision_dp_cpu_pre_shard: dict[str, int] | None = None,
     ) -> None:
         assert isinstance(base_examples, list) and len(base_examples) > 0, "base_examples must be a non-empty list"
         self._base_examples = base_examples
@@ -90,7 +93,12 @@ class DirectSFTDataset(torch.utils.data.Dataset):
             # here when enable_in_batch_packing is set.
             "enable_in_batch_packing": enable_in_batch_packing and not defer_in_batch_packing_to_step,
             "in_batch_packing_pad_to_multiple_of": in_batch_packing_pad_to_multiple_of,
+            "in_batch_packing_attention_on_padding": in_batch_packing_attention_on_padding,
         }
+        if precompute_mrope_position_ids is not None:
+            collate_kwargs["precompute_mrope_position_ids"] = precompute_mrope_position_ids
+        if vision_dp_cpu_pre_shard is not None:
+            collate_kwargs["vision_dp_cpu_pre_shard"] = vision_dp_cpu_pre_shard
         if explicit_collate_impl:
             collate_kwargs = _collate_kwargs_for_impl(
                 collate_impl,

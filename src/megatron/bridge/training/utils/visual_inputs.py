@@ -47,6 +47,11 @@ class GenericVisualInputs:
     image_sizes: Optional[torch.Tensor] = None
     image_position_ids: Optional[torch.Tensor] = None  # Gemma4-VL: 2D patch position coords [B, N, 2]
     mm_token_type_ids: Optional[torch.Tensor] = None
+    # Optional Qwen3-VL CPU pre-sharding metadata. ``pixel_values`` contains
+    # only this vision-DP rank's packed patches when these fields are present,
+    # while ``image_grid_thw`` retains the global grid for FLOP accounting.
+    vision_dp_local_grid_thw: Optional[torch.Tensor] = None
+    vision_dp_seqlens: Optional[torch.Tensor] = None
 
     def pin_memory(self) -> "GenericVisualInputs":
         """Pin contained CPU tensors so non-blocking H2D copies are effective."""
