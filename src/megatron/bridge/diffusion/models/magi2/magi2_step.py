@@ -28,16 +28,68 @@ from megatron.bridge.training.state import GlobalState
 
 
 def magi2_timestep_embedding(timestep: Tensor, width: int) -> Tensor:
-    """Create the sinusoidal time embedding consumed as a text-width token."""
+    """Create MAGI-2's per-token time-channel embedding."""
+    if width < 0:
+        raise ValueError("time-channel width must be non-negative")
+    if width == 0:
+        return torch.empty(timestep.numel(), 0, dtype=torch.float32, device=timestep.device)
+    if width == 1:
+        return timestep.float().reshape(-1, 1)
     half = width // 2
     frequencies = torch.exp(
-        -math.log(10_000.0) * torch.arange(half, dtype=torch.float32, device=timestep.device) / max(half, 1)
+        -math.log(10_000.0) * torch.arange(half, dtype=torch.float32, device=timestep.device) / half
     )
     angles = timestep.float().reshape(-1, 1) * 1000.0 * frequencies.reshape(1, -1)
     embedding = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
     if width % 2:
         embedding = torch.cat((embedding, torch.zeros_like(embedding[:, :1])), dim=-1)
     return embedding
+
+
+def magi2_prepare_flow_inputs(
+    clean_inputs: Tensor,
+    modality_mapping: Tensor,
+    token_sigmas: Tensor,
+    *,
+    video_in_channels: int,
+    audio_in_channels: int,
+    time_channel_dim: int,
+    noise: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Build official MAGI-2 flow inputs, targets, masks, and time channels."""
+    if clean_inputs.ndim != 2:
+        raise ValueError("clean_inputs must have shape [tokens, channels]")
+    token_count = clean_inputs.shape[0]
+    if modality_mapping.shape != (token_count,):
+        raise ValueError("modality_mapping must have shape [tokens]")
+    if token_sigmas.shape != (token_count,):
+        raise ValueError("token_sigmas must have shape [tokens]")
+    if noise is None:
+        noise = torch.randn_like(clean_inputs)
+    elif noise.shape != clean_inputs.shape:
+        raise ValueError("noise must have the same shape as clean_inputs")
+
+    model_inputs = clean_inputs.clone()
+    output_width = max(video_in_channels, audio_in_channels)
+    target = clean_inputs.new_zeros(token_count, output_width)
+    loss_mask = clean_inputs.new_zeros(token_count, output_width)
+    time_values = token_sigmas.new_zeros(token_count)
+
+    for modality, channels in (
+        (Magi2Modality.VIDEO, video_in_channels),
+        (Magi2Modality.AUDIO, audio_in_channels),
+    ):
+        selected = modality_mapping == modality
+        selected_sigma = token_sigmas[selected].unsqueeze(-1)
+        clean = clean_inputs[selected, :channels]
+        selected_noise = noise[selected, :channels]
+        model_inputs[selected, :channels] = (1.0 - selected_sigma) * clean + selected_sigma * selected_noise
+        target[selected, :channels] = selected_noise - clean
+        loss_mask[selected, :channels] = 1.0
+        time_values[selected] = token_sigmas[selected]
+
+    time_token_sequence = magi2_timestep_embedding(time_values, time_channel_dim)
+    return model_inputs, target, loss_mask, time_token_sequence
 
 
 def magi2_flow_loss(
@@ -86,44 +138,31 @@ class Magi2ForwardStep:
             device=clean_inputs.device,
         )
 
-        timesteps = torch.rand(batch_size, device=clean_inputs.device)
-        token_timesteps = timesteps.repeat_interleave(sequence_length)
-        noise = torch.randn_like(flattened_clean)
-        model_inputs = flattened_clean.clone()
-        output_width = max(
-            state.cfg.model.magi2_video_in_channels,
-            state.cfg.model.magi2_audio_in_channels,
+        sigmas = torch.rand(batch_size, device=clean_inputs.device)
+        token_sigmas = sigmas.repeat_interleave(sequence_length)
+        model_inputs, target, loss_mask, time_token_sequence = magi2_prepare_flow_inputs(
+            flattened_clean,
+            flattened_mapping,
+            token_sigmas,
+            video_in_channels=state.cfg.model.magi2_video_in_channels,
+            audio_in_channels=state.cfg.model.magi2_audio_in_channels,
+            time_channel_dim=state.cfg.dataset.time_channel_dim,
         )
-        target = torch.zeros(flattened_clean.shape[0], output_width, device=clean_inputs.device)
-        loss_mask = torch.zeros_like(target)
-
-        for modality, channels in (
-            (Magi2Modality.VIDEO, state.cfg.model.magi2_video_in_channels),
-            (Magi2Modality.AUDIO, state.cfg.model.magi2_audio_in_channels),
-        ):
-            selected = flattened_mapping == modality
-            selected_timestep = token_timesteps[selected].unsqueeze(-1)
-            clean = flattened_clean[selected, :channels]
-            selected_noise = noise[selected, :channels]
-            model_inputs[selected, :channels] = selected_timestep * clean + (1.0 - selected_timestep) * selected_noise
-            target[selected, :channels] = clean - selected_noise
-            loss_mask[selected, :channels] = 1.0
-
-        time_selected = flattened_mapping == Magi2Modality.TIME
-        if time_selected.any():
-            time_values = token_timesteps[time_selected]
-            model_inputs[time_selected, : state.cfg.model.magi2_text_in_channels] = magi2_timestep_embedding(
-                time_values, state.cfg.model.magi2_text_in_channels
-            )
 
         output = model(
             model_inputs,
             flattened_coordinates,
             flattened_mapping,
             cu_seqlens,
+            time_token_sequence=time_token_sequence,
         )
         squared_error = (output.float() - target).square()
         return squared_error, partial(magi2_flow_loss, loss_mask)
 
 
-__all__ = ["Magi2ForwardStep", "magi2_flow_loss", "magi2_timestep_embedding"]
+__all__ = [
+    "Magi2ForwardStep",
+    "magi2_flow_loss",
+    "magi2_prepare_flow_inputs",
+    "magi2_timestep_embedding",
+]

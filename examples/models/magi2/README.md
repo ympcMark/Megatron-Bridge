@@ -60,3 +60,10 @@ production run should replace only this DatasetProvider with a provider that
 emits VAE/audio latents, text-encoder states, 3-axis coordinates, and modality
 IDs using the same batch keys. The model and pretraining step do not need to be
 rewritten.
+
+The flow step follows the released inference convention: it forms
+`x_sigma = (1 - sigma) * x0 + sigma * noise`, predicts `noise - x0`, and passes
+the official 64-channel sinusoidal timestep embedding for every packed token to
+MCore. Video and audio tokens receive their sampled sigma; clean text tokens
+receive sigma zero. The released configuration does not add a separate TIME
+token.

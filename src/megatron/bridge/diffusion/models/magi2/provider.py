@@ -79,7 +79,7 @@ class Magi2ModelProvider(Magi2Config, ModelProviderMixin[Magi2Model]):
     and distributed multi-head MoE all live in ``megatron.core.models.magi2``.
     """
 
-    seq_length: int = 12
+    seq_length: int = 11
     vocab_size: int = 1
     make_vocab_size_divisible_by: int = 1
     share_embeddings_and_output_weights: bool = False

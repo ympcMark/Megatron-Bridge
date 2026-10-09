@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import Mock
 
 import examples.models.magi2.pretrain_magi2 as pretrain_module
 import pytest
 import torch
-from megatron.core.models.magi2 import Magi2Config, Magi2Model, Magi2TransformerLayerSpecs
+from megatron.core.models.magi2 import Magi2Config, Magi2Modality, Magi2Model, Magi2TransformerLayerSpecs
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 import megatron.bridge.diffusion.models.magi2.provider as provider_module
 from megatron.bridge.diffusion.models.magi2.data import Magi2LatentDataset
-from megatron.bridge.diffusion.models.magi2.magi2_step import magi2_flow_loss, magi2_timestep_embedding
+from megatron.bridge.diffusion.models.magi2.magi2_step import (
+    magi2_flow_loss,
+    magi2_prepare_flow_inputs,
+    magi2_timestep_embedding,
+)
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 
 
@@ -110,7 +115,6 @@ def test_latent_dataset_is_reproducible_and_uses_public_channel_widths():
         video_tokens=2,
         audio_tokens=2,
         text_tokens=1,
-        time_tokens=1,
         video_in_channels=48,
         audio_in_channels=64,
         text_in_channels=5120,
@@ -119,10 +123,66 @@ def test_latent_dataset_is_reproducible_and_uses_public_channel_widths():
     first = dataset[0]
     repeated = dataset[0]
 
-    assert first["clean_inputs"].shape == (6, 5120)
-    assert first["coordinates"].shape == (6, 9)
+    assert first["clean_inputs"].shape == (5, 5120)
+    assert first["coordinates"].shape == (5, 9)
     assert torch.equal(first["clean_inputs"], repeated["clean_inputs"])
     assert torch.equal(first["modality_mapping"], repeated["modality_mapping"])
+    assert not torch.any(first["modality_mapping"] == Magi2Modality.TIME)
+
+
+def test_time_embedding_matches_official_magi2_definition():
+    timesteps = torch.tensor([0.0, 0.25, 1.0])
+    embedding = magi2_timestep_embedding(timesteps, 64)
+    half = 32
+    frequencies = torch.exp(-math.log(10_000.0) * torch.arange(half, dtype=torch.float32) / half)
+    angles = timesteps[:, None] * 1000.0 * frequencies[None]
+    official = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
+
+    torch.testing.assert_close(embedding, official, rtol=0.0, atol=0.0)
+
+
+def test_flow_inputs_match_official_sigma_direction_and_time_channels():
+    clean = torch.tensor(
+        [
+            [1.0, 2.0, 30.0],
+            [4.0, 5.0, 60.0],
+            [7.0, 8.0, 9.0],
+        ]
+    )
+    noise = torch.tensor(
+        [
+            [11.0, 12.0, 130.0],
+            [14.0, 15.0, 160.0],
+            [17.0, 18.0, 19.0],
+        ]
+    )
+    mapping = torch.tensor([Magi2Modality.VIDEO, Magi2Modality.AUDIO, Magi2Modality.TEXT])
+    sigmas = torch.tensor([0.0, 1.0, 0.75])
+
+    model_inputs, target, loss_mask, time_sequence = magi2_prepare_flow_inputs(
+        clean,
+        mapping,
+        sigmas,
+        video_in_channels=2,
+        audio_in_channels=3,
+        time_channel_dim=64,
+        noise=noise,
+    )
+
+    torch.testing.assert_close(model_inputs[0], clean[0])
+    torch.testing.assert_close(model_inputs[1], noise[1])
+    torch.testing.assert_close(model_inputs[2], clean[2])
+    torch.testing.assert_close(target[0], torch.tensor([10.0, 10.0, 0.0]))
+    torch.testing.assert_close(target[1], torch.tensor([10.0, 10.0, 100.0]))
+    torch.testing.assert_close(target[2], torch.zeros(3))
+    torch.testing.assert_close(
+        loss_mask,
+        torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        time_sequence,
+        magi2_timestep_embedding(torch.tensor([0.0, 1.0, 0.0]), 64),
+    )
 
 
 def test_timestep_embedding_and_flow_loss_are_finite():

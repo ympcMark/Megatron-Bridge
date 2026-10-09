@@ -169,7 +169,7 @@ def _apply_smoke_overrides(cfg, world_size: int) -> None:
     cfg.model.num_attention_heads = 4
     cfg.model.num_query_groups = 4
     cfg.model.kv_channels = 16
-    cfg.model.seq_length = 6
+    cfg.model.seq_length = 5
     cfg.model.ffn_hidden_size = 128
     cfg.model.magi2_video_in_channels = 8
     cfg.model.magi2_audio_in_channels = 8
@@ -194,7 +194,6 @@ def _apply_smoke_overrides(cfg, world_size: int) -> None:
     cfg.dataset.video_tokens = 2
     cfg.dataset.audio_tokens = 2
     cfg.dataset.text_tokens = 1
-    cfg.dataset.time_tokens = 1
     cfg.train.global_batch_size = world_size
 
 
@@ -294,13 +293,11 @@ def main() -> None:
             "data": {
                 "kind": "deterministic synthetic latent integration data",
                 "seed": cfg.dataset.seed,
-                "tokens_per_sample": cfg.dataset.video_tokens
-                + cfg.dataset.audio_tokens
-                + cfg.dataset.text_tokens
-                + cfg.dataset.time_tokens,
+                "tokens_per_sample": cfg.dataset.video_tokens + cfg.dataset.audio_tokens + cfg.dataset.text_tokens,
                 "video_channels": cfg.dataset.video_in_channels,
                 "audio_channels": cfg.dataset.audio_in_channels,
                 "text_channels": cfg.dataset.text_in_channels,
+                "time_channel_dim": cfg.dataset.time_channel_dim,
             },
             "software": {
                 "torch": torch.__version__,
@@ -322,7 +319,7 @@ def main() -> None:
             args.loss_output.resolve(),
             args.router_bias_ema,
             cfg.train.global_batch_size,
-            cfg.dataset.video_tokens + cfg.dataset.audio_tokens + cfg.dataset.text_tokens + cfg.dataset.time_tokens,
+            cfg.dataset.video_tokens + cfg.dataset.audio_tokens + cfg.dataset.text_tokens,
             context,
         ),
     )

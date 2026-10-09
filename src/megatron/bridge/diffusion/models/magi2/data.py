@@ -37,7 +37,6 @@ class Magi2LatentDataset(Dataset):
         video_tokens: int,
         audio_tokens: int,
         text_tokens: int,
-        time_tokens: int,
         video_in_channels: int,
         audio_in_channels: int,
         text_in_channels: int,
@@ -47,7 +46,6 @@ class Magi2LatentDataset(Dataset):
         self.video_tokens = video_tokens
         self.audio_tokens = audio_tokens
         self.text_tokens = text_tokens
-        self.time_tokens = time_tokens
         self.video_in_channels = video_in_channels
         self.audio_in_channels = audio_in_channels
         self.text_in_channels = text_in_channels
@@ -60,8 +58,7 @@ class Magi2LatentDataset(Dataset):
         modality_mapping = torch.tensor(
             [Magi2Modality.VIDEO] * self.video_tokens
             + [Magi2Modality.AUDIO] * self.audio_tokens
-            + [Magi2Modality.TEXT] * self.text_tokens
-            + [Magi2Modality.TIME] * self.time_tokens,
+            + [Magi2Modality.TEXT] * self.text_tokens,
             dtype=torch.long,
         )
         token_count = modality_mapping.numel()
@@ -102,7 +99,7 @@ class Magi2LatentDatasetConfig(DatasetProvider):
     video_tokens: int = 4
     audio_tokens: int = 4
     text_tokens: int = 3
-    time_tokens: int = 1
+    time_channel_dim: int = 64
     video_in_channels: int = 48
     audio_in_channels: int = 64
     text_in_channels: int = 5120
@@ -125,7 +122,6 @@ class Magi2LatentDatasetConfig(DatasetProvider):
                 video_tokens=self.video_tokens,
                 audio_tokens=self.audio_tokens,
                 text_tokens=self.text_tokens,
-                time_tokens=self.time_tokens,
                 video_in_channels=self.video_in_channels,
                 audio_in_channels=self.audio_in_channels,
                 text_in_channels=self.text_in_channels,
