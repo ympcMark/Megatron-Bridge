@@ -29,6 +29,9 @@ from megatron.bridge.diffusion.models.magi2.magi2_step import (
     magi2_timestep_embedding,
 )
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
+from megatron.bridge.recipes.magi2.h100.magi2 import (
+    magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
+)
 
 
 pytestmark = [pytest.mark.unit]
@@ -45,6 +48,21 @@ def test_original_provider_is_native_mcore_config():
     assert provider.magi2_flattened_num_experts == 3072
     assert provider.magi2_moe_top_k == 6
     assert provider.magi2_parameter_count == 113_934_732_336
+
+
+def test_original_fsdp_recipe_uses_fully_sharded_dtensor_contract():
+    cfg = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config()
+
+    assert cfg.dist.use_megatron_fsdp
+    assert cfg.ddp.use_megatron_fsdp
+    assert cfg.ddp.megatron_fsdp_version == 1
+    assert cfg.ddp.data_parallel_sharding_strategy == "optim_grads_params"
+    assert cfg.ddp.expert_data_parallel_sharding_strategy == "optim_grads_params"
+    assert cfg.ddp.megatron_fsdp_main_params_dtype == torch.float32
+    assert cfg.ddp.megatron_fsdp_main_grads_dtype == torch.float32
+    assert cfg.ddp.megatron_fsdp_grad_comm_dtype == torch.float32
+    assert not cfg.ddp.average_in_collective
+    assert cfg.checkpoint.ckpt_format == "fsdp_dtensor"
 
 
 def test_provider_only_selects_specs_and_instantiates_native_model(monkeypatch):

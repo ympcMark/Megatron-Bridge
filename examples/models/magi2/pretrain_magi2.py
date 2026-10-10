@@ -35,6 +35,7 @@ from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
 from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_config,
+    magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
 )
 from megatron.bridge.training.callbacks import CallbackContext, CallbackManager
 from megatron.bridge.training.pretrain import pretrain
@@ -71,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--router-bias-ema", type=float, default=0.999)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Use Megatron FSDP V1 with fully sharded parameters, gradients, and optimizer state.",
+    )
     return parser.parse_args()
 
 
@@ -221,7 +227,11 @@ def main() -> None:
     if args.loss_output.exists():
         raise ValueError(f"loss output already exists: {args.loss_output}")
 
-    cfg = magi2_114b_pretrain_64gpu_h100_bf16_config()
+    if args.fsdp:
+        recipe = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config
+    else:
+        recipe = magi2_114b_pretrain_64gpu_h100_bf16_config
+    cfg = recipe()
     if args.smoke:
         _apply_smoke_overrides(cfg, world_size)
     cfg.train.train_iters = args.train_iters
@@ -283,6 +293,10 @@ def main() -> None:
                 "global_batch_size": cfg.train.global_batch_size,
                 "precision": "bf16_mixed",
                 "checkpoint_format": cfg.checkpoint.ckpt_format,
+                "megatron_fsdp": cfg.dist.use_megatron_fsdp,
+                "megatron_fsdp_version": cfg.ddp.megatron_fsdp_version,
+                "data_parallel_sharding_strategy": cfg.ddp.data_parallel_sharding_strategy,
+                "expert_data_parallel_sharding_strategy": cfg.ddp.expert_data_parallel_sharding_strategy,
                 "save_interval": cfg.checkpoint.save_interval,
                 "save": cfg.checkpoint.save,
                 "load": None if args.load is None else str(args.load.resolve()),

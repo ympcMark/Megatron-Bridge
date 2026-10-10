@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import torch
+
 from megatron.bridge.diffusion.models.magi2.data import Magi2LatentDatasetConfig
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 from megatron.bridge.recipes.common import _pretrain_common
@@ -77,4 +79,23 @@ def magi2_114b_pretrain_64gpu_h100_bf16_config() -> ConfigContainer:
     return cfg
 
 
-__all__ = ["magi2_114b_pretrain_64gpu_h100_bf16_config"]
+def magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config() -> ConfigContainer:
+    """Return the original-size MAGI-2 recipe with Megatron FSDP V1."""
+    cfg = magi2_114b_pretrain_64gpu_h100_bf16_config()
+    cfg.dist.use_megatron_fsdp = True
+    cfg.ddp.use_megatron_fsdp = True
+    cfg.ddp.megatron_fsdp_version = 1
+    cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+    cfg.ddp.expert_data_parallel_sharding_strategy = "optim_grads_params"
+    cfg.ddp.megatron_fsdp_main_params_dtype = torch.float32
+    cfg.ddp.megatron_fsdp_main_grads_dtype = torch.float32
+    cfg.ddp.megatron_fsdp_grad_comm_dtype = torch.float32
+    cfg.ddp.average_in_collective = False
+    cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+    return cfg
+
+
+__all__ = [
+    "magi2_114b_pretrain_64gpu_h100_bf16_config",
+    "magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config",
+]

@@ -4,7 +4,11 @@
 
 from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_config,
+    magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
 )
 
 
-__all__ = ["magi2_114b_pretrain_64gpu_h100_bf16_config"]
+__all__ = [
+    "magi2_114b_pretrain_64gpu_h100_bf16_config",
+    "magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config",
+]
