@@ -95,7 +95,19 @@ def magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config() -> ConfigContainer:
     return cfg
 
 
+def magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config() -> ConfigContainer:
+    """Return the original-size MAGI-2 recipe with FSDP, CP2, and EP64."""
+    cfg = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config()
+    cfg.model.context_parallel_size = 2
+    cfg.model.cp_comm_type = "all_gather"
+    cfg.model.seq_length = 12
+    cfg.model.calculate_per_token_loss = True
+    cfg.ddp.average_in_collective = False
+    return cfg
+
+
 __all__ = [
     "magi2_114b_pretrain_64gpu_h100_bf16_config",
     "magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config",
+    "magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config",
 ]

@@ -36,6 +36,7 @@ from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
 from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_config,
     magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
+    magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config,
 )
 from megatron.bridge.training.callbacks import CallbackContext, CallbackManager
 from megatron.bridge.training.pretrain import pretrain
@@ -76,6 +77,18 @@ def parse_args() -> argparse.Namespace:
         "--fsdp",
         action="store_true",
         help="Use Megatron FSDP V1 with fully sharded parameters, gradients, and optimizer state.",
+    )
+    parser.add_argument(
+        "--context-parallel-size",
+        type=int,
+        default=1,
+        help="Shard the packed token stream over this many context-parallel ranks.",
+    )
+    parser.add_argument(
+        "--cp-comm-type",
+        choices=("all_gather",),
+        default="all_gather",
+        help="MAGI-2 sink-compatible context-parallel communication strategy.",
     )
     return parser.parse_args()
 
@@ -203,6 +216,21 @@ def _apply_smoke_overrides(cfg, world_size: int) -> None:
     cfg.train.global_batch_size = world_size
 
 
+def _apply_context_parallel_overrides(cfg, context_parallel_size: int, cp_comm_type: str) -> None:
+    if context_parallel_size <= 0:
+        raise ValueError("context-parallel-size must be positive")
+    cfg.model.context_parallel_size = context_parallel_size
+    if context_parallel_size == 1:
+        cfg.model.cp_comm_type = None
+        return
+    cfg.model.cp_comm_type = cp_comm_type
+    logical_sequence_length = cfg.dataset.video_tokens + cfg.dataset.audio_tokens + cfg.dataset.text_tokens
+    alignment = 2 * context_parallel_size
+    cfg.model.seq_length = math.ceil(logical_sequence_length / alignment) * alignment
+    cfg.model.calculate_per_token_loss = True
+    cfg.ddp.average_in_collective = False
+
+
 def main() -> None:
     """Configure callbacks, checkpointing, and execute Bridge pretraining."""
     args = parse_args()
@@ -227,13 +255,16 @@ def main() -> None:
     if args.loss_output.exists():
         raise ValueError(f"loss output already exists: {args.loss_output}")
 
-    if args.fsdp:
+    if args.fsdp and args.context_parallel_size == 2:
+        recipe = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config
+    elif args.fsdp:
         recipe = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config
     else:
         recipe = magi2_114b_pretrain_64gpu_h100_bf16_config
     cfg = recipe()
     if args.smoke:
         _apply_smoke_overrides(cfg, world_size)
+    _apply_context_parallel_overrides(cfg, args.context_parallel_size, args.cp_comm_type)
     cfg.train.train_iters = args.train_iters
     cfg.train.exit_interval = args.exit_interval
     cfg.scheduler.lr_decay_iters = args.lr_decay_iters or args.train_iters
@@ -273,7 +304,7 @@ def main() -> None:
             "backends": {
                 "model": "native megatron.core.models.magi2.Magi2Model",
                 "transformer": "MCore TransformerBlock with MAGI-2 dense and MoE layer specs",
-                "attention": "native differentiable MAGI-2 variable-length correctness attention",
+                "attention": ("native differentiable MAGI-2 packed attention with MCore CP collectives"),
                 "experts": "MCore all-to-all MoELayer with Transformer Engine grouped GEMM",
                 "router": "native MAGI-2 head-constrained sigmoid top-k in fp32",
             },
@@ -284,6 +315,7 @@ def main() -> None:
                 "tensor": cfg.model.tensor_model_parallel_size,
                 "pipeline": cfg.model.pipeline_model_parallel_size,
                 "context": cfg.model.context_parallel_size,
+                "context_comm_type": cfg.model.cp_comm_type,
                 "expert": cfg.model.expert_model_parallel_size,
             },
             "training": {

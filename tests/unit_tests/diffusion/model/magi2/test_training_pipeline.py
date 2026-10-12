@@ -18,19 +18,29 @@ from unittest.mock import Mock
 import examples.models.magi2.pretrain_magi2 as pretrain_module
 import pytest
 import torch
-from megatron.core.models.magi2 import Magi2Config, Magi2Modality, Magi2Model, Magi2TransformerLayerSpecs
+from megatron.core.models.magi2 import (
+    Magi2Config,
+    Magi2ContextParallelDotProductAttention,
+    Magi2Modality,
+    Magi2Model,
+    Magi2TransformerLayerSpecs,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 
+import megatron.bridge.diffusion.models.magi2.magi2_step as step_module
 import megatron.bridge.diffusion.models.magi2.provider as provider_module
 from megatron.bridge.diffusion.models.magi2.data import Magi2LatentDataset
 from megatron.bridge.diffusion.models.magi2.magi2_step import (
+    magi2_deterministic_flow_random,
     magi2_flow_loss,
     magi2_prepare_flow_inputs,
     magi2_timestep_embedding,
+    partition_magi2_batch_for_context_parallel,
 )
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
+    magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config,
 )
 
 
@@ -63,6 +73,27 @@ def test_original_fsdp_recipe_uses_fully_sharded_dtensor_contract():
     assert cfg.ddp.megatron_fsdp_grad_comm_dtype == torch.float32
     assert not cfg.ddp.average_in_collective
     assert cfg.checkpoint.ckpt_format == "fsdp_dtensor"
+
+
+def test_original_fsdp_cp2_recipe_uses_per_element_global_normalization():
+    cfg = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config()
+
+    assert cfg.model.context_parallel_size == 2
+    assert cfg.model.cp_comm_type == "all_gather"
+    assert cfg.model.seq_length == 12
+    assert cfg.model.expert_model_parallel_size == 64
+    assert cfg.model.calculate_per_token_loss
+    assert not cfg.ddp.average_in_collective
+
+
+def test_cp_provider_selects_mcore_context_parallel_attention():
+    provider = Magi2ModelProvider()
+    provider.context_parallel_size = 2
+    provider.cp_comm_type = "all_gather"
+
+    specs = provider_module.default_magi2_layer_specs(provider)
+
+    assert specs.dense.submodules.self_attention.submodules.core_attention is Magi2ContextParallelDotProductAttention
 
 
 def test_provider_only_selects_specs_and_instantiates_native_model(monkeypatch):
@@ -203,6 +234,20 @@ def test_flow_inputs_match_official_sigma_direction_and_time_channels():
     )
 
 
+def test_synthetic_flow_random_is_stable_per_sample_and_step():
+    clean = torch.zeros(2, 3, 4)
+    sample_ids = torch.tensor([9, 3])
+
+    first = magi2_deterministic_flow_random(clean, sample_ids, step=2, seed=42)
+    repeated = magi2_deterministic_flow_random(clean, sample_ids, step=2, seed=42)
+    next_step = magi2_deterministic_flow_random(clean, sample_ids, step=3, seed=42)
+
+    torch.testing.assert_close(first[0], repeated[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(first[1], repeated[1], rtol=0.0, atol=0.0)
+    assert not torch.equal(first[0], next_step[0])
+    assert not torch.equal(first[1], next_step[1])
+
+
 def test_timestep_embedding_and_flow_loss_are_finite():
     embedding = magi2_timestep_embedding(torch.tensor([0.25, 0.75]), 9)
     squared_error = torch.tensor([[1.0, 4.0], [9.0, 16.0]])
@@ -212,9 +257,33 @@ def test_timestep_embedding_and_flow_loss_are_finite():
 
     assert embedding.shape == (2, 9)
     assert torch.isfinite(embedding).all()
-    torch.testing.assert_close(loss, torch.tensor(2.5))
-    assert valid_tokens.item() == 1
+    torch.testing.assert_close(loss, torch.tensor(5.0))
+    assert valid_tokens.item() == 2
     torch.testing.assert_close(metrics["flow_mse"], torch.tensor([5.0, 2.0]))
+
+
+def test_context_parallel_partition_pads_each_sample_and_masks_padding(monkeypatch):
+    cp_group = Mock()
+    cp_group.size.return_value = 2
+    indices = torch.tensor([0, 3])
+    partition = Mock(return_value=indices)
+    monkeypatch.setattr(step_module, "get_thd_cp_partition_indices", partition)
+    mapping = torch.tensor([[Magi2Modality.VIDEO, Magi2Modality.AUDIO, Magi2Modality.TEXT]])
+    values = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
+
+    local, logical, physical, split_sizes, global_indices = partition_magi2_batch_for_context_parallel(
+        {"values": values, "modality_mapping": mapping},
+        sequence_length=3,
+        cp_group=cp_group,
+    )
+
+    assert logical.tolist() == [0, 3]
+    assert physical.tolist() == [0, 4]
+    assert split_sizes.tolist() == [2, 2]
+    assert global_indices.tolist() == [0, 3]
+    assert local["values"].shape == (2, 2)
+    assert local["modality_mapping"].tolist() == [0, 2]
+    partition.assert_called_once()
 
 
 def test_official_checkpoint_hook_delegates_to_native_mcore_loader(monkeypatch, tmp_path):

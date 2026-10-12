@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from megatron.core.models.magi2 import (
     Magi2Config,
+    Magi2ContextParallelDotProductAttention,
     Magi2DotProductAttention,
     Magi2Model,
     Magi2TransformerLayerSpecs,
@@ -60,9 +61,12 @@ _ORIGINAL_ARCHITECTURE_FIELDS = (
 )
 
 
-def default_magi2_layer_specs(_: Magi2Config) -> Magi2TransformerLayerSpecs:
+def default_magi2_layer_specs(config: Magi2Config) -> Magi2TransformerLayerSpecs:
     """Select the correctness-first native MCore MAGI-2 layer specs."""
-    return get_magi2_layer_specs(Magi2DotProductAttention)
+    core_attention = (
+        Magi2ContextParallelDotProductAttention if config.context_parallel_size > 1 else Magi2DotProductAttention
+    )
+    return get_magi2_layer_specs(core_attention)
 
 
 def _architecture_mismatches(config: Magi2Config) -> list[str]:

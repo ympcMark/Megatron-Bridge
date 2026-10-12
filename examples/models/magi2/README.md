@@ -14,7 +14,8 @@ The provider passes one native `Magi2Config`, MCore layer specs, and the active
 layers. The routed path uses MCore expert parallelism: head-local expert IDs are
 flattened into 3072 experts, routed with the MAGI-2 sigmoid/top-6 rule,
 dispatched by MCore all-to-all, and evaluated by Transformer Engine grouped
-GEMM. The current correctness recipe fixes TP, PP, and CP to one and uses EP=64.
+GEMM. The original-size recipes fix TP and PP to one, use EP=64, and support
+either CP1 or CP2. The CP2 recipe also enables MCore FSDP V1.
 
 ## Integration run
 
@@ -38,6 +39,20 @@ Each run writes a JSON manifest plus one JSONL row per optimizer step. Rows reco
 finite-loss and finite-gradient checks, skipped iterations, cross-rank peak
 memory, and throughput.
 
+To run the full model with EP64, CP2, and fully sharded parameters, gradients,
+and optimizer state, add:
+
+```bash
+--fsdp --context-parallel-size 2 --cp-comm-type all_gather
+```
+
+Bridge pads each logical 11-token sample to 12 physical THD positions, applies
+MCore's per-document zigzag partition, and excludes the padding from the flow
+loss. MCore gathers K/V with an autograd-aware collective and computes the
+official learnable-sink attention for the local queries. `all_gather` is the
+only supported CP communication mode because the current Transformer Engine
+CP kernels do not support MAGI-2's learnable softmax offset.
+
 ## Checkpoints
 
 Use `--official-checkpoint /path/to/MAGI-2-preview` to initialize the native
@@ -60,6 +75,10 @@ production run should replace only this DatasetProvider with a provider that
 emits VAE/audio latents, text-encoder states, 3-axis coordinates, and modality
 IDs using the same batch keys. The model and pretraining step do not need to be
 rewritten.
+
+For topology-independent integration comparisons, synthetic sigma and noise are
+derived from the sample ID and optimizer step. Repartitioning the same global
+batch between CP1 and CP2 therefore does not change the flow targets.
 
 The flow step follows the released inference convention: it forms
 `x_sigma = (1 - sigma) * x0 + sigma * noise`, predicts `noise - x0`, and passes
