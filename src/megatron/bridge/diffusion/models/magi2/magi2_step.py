@@ -70,6 +70,8 @@ def magi2_prepare_flow_inputs(
         noise = torch.randn_like(clean_inputs)
     elif noise.shape != clean_inputs.shape:
         raise ValueError("noise must have the same shape as clean_inputs")
+    else:
+        noise = noise.to(device=clean_inputs.device, dtype=clean_inputs.dtype)
 
     model_inputs = clean_inputs.clone()
     output_width = max(video_in_channels, audio_in_channels)
@@ -82,7 +84,7 @@ def magi2_prepare_flow_inputs(
         (Magi2Modality.AUDIO, audio_in_channels),
     ):
         selected = modality_mapping == modality
-        selected_sigma = token_sigmas[selected].unsqueeze(-1)
+        selected_sigma = token_sigmas[selected].to(dtype=clean_inputs.dtype).unsqueeze(-1)
         clean = clean_inputs[selected, :channels]
         selected_noise = noise[selected, :channels]
         model_inputs[selected, :channels] = (1.0 - selected_sigma) * clean + selected_sigma * selected_noise

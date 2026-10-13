@@ -29,6 +29,7 @@ from megatron.core.models.magi2 import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 import megatron.bridge.diffusion.models.magi2.magi2_step as step_module
+import megatron.bridge.diffusion.models.magi2.media_preprocessing as media_preprocessing_module
 import megatron.bridge.diffusion.models.magi2.provider as provider_module
 from megatron.bridge.diffusion.models.magi2.data import (
     Magi2DiskLatentDataset,
@@ -326,6 +327,31 @@ def test_media_manifest_resolves_relative_paths_and_rejects_duplicate_ids(tmp_pa
         read_magi2_media_manifest(manifest_path)
 
 
+def test_official_encoder_rejects_incompatible_transformers_before_loading_weights(monkeypatch, tmp_path):
+    import transformers
+
+    official_repo = tmp_path / "official"
+    checkpoint_root = tmp_path / "checkpoint"
+    required_files = (
+        official_repo / "inference/model/vae2_2.py",
+        official_repo / "inference/model/qwen35.py",
+        official_repo / "inference/pipeline/audio_decoder.py",
+        checkpoint_root / "vae/Wan2.2_VAE.pth",
+        checkpoint_root / "stable-audio-open-1.0/model_config.json",
+        checkpoint_root / "stable-audio-open-1.0/model.safetensors",
+        checkpoint_root / "text_encoder/config.json",
+        checkpoint_root / "text_encoder/model.safetensors",
+    )
+    for path in required_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(transformers, "__version__", "5.3.0")
+
+    with pytest.raises(RuntimeError, match=r"transformers>=5\.5\.0; found 5\.3\.0"):
+        media_preprocessing_module.OfficialMagi2Encoders(official_repo, checkpoint_root)
+
+
 def test_time_embedding_matches_official_magi2_definition():
     timesteps = torch.tensor([0.0, 0.25, 1.0])
     embedding = magi2_timestep_embedding(timesteps, 64)
@@ -379,6 +405,30 @@ def test_flow_inputs_match_official_sigma_direction_and_time_channels():
         time_sequence,
         magi2_timestep_embedding(torch.tensor([0.0, 1.0, 0.0]), 64),
     )
+
+
+def test_flow_inputs_preserve_bfloat16_latent_storage_dtype():
+    clean = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+    noise = torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float32)
+    mapping = torch.tensor([Magi2Modality.VIDEO, Magi2Modality.TEXT])
+    sigmas = torch.tensor([0.25, 0.0], dtype=torch.float32)
+
+    model_inputs, target, loss_mask, time_sequence = magi2_prepare_flow_inputs(
+        clean,
+        mapping,
+        sigmas,
+        video_in_channels=2,
+        audio_in_channels=2,
+        time_channel_dim=4,
+        noise=noise,
+    )
+
+    assert model_inputs.dtype == torch.bfloat16
+    assert target.dtype == torch.bfloat16
+    assert loss_mask.dtype == torch.bfloat16
+    assert time_sequence.dtype == torch.float32
+    torch.testing.assert_close(model_inputs[0], torch.tensor([2.0, 3.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(target[0], torch.tensor([4.0, 4.0], dtype=torch.bfloat16))
 
 
 def test_synthetic_flow_random_is_stable_per_sample_and_step():

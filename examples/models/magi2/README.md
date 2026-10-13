@@ -115,6 +115,11 @@ uv run --extra diffusion python scripts/training/prepare_magi2_media_latents.py 
   --checkpoint-root /path/to/MAGI-2-preview/ckpt
 ```
 
+The official Qwen3.5 loader requires `transformers>=5.5.0`; version 5.3 passes
+the composite configuration where a text-only configuration is required and
+fails before loading the vocabulary weights. Keep media encoding in an isolated
+environment when the training container pins an older Transformers release.
+
 Only encoder weights are required: `vae/Wan2.2_VAE.pth`,
 `stable-audio-open-1.0/{model_config.json,model.safetensors}`, and the complete
 `text_encoder/` directory. They total roughly 64 GB in the public release; the

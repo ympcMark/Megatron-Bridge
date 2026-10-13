@@ -26,6 +26,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from megatron.core.models.magi2 import Magi2Modality
+from packaging.version import Version
 from torch import Tensor
 
 
@@ -324,7 +325,17 @@ class OfficialMagi2Encoders:
             raise RuntimeError("official MAGI-2 media encoding requires a CUDA device")
         repository = Path(official_repo).resolve()
         checkpoint = Path(checkpoint_root).resolve()
-        torch.cuda.set_device(torch.device(device))
+        import transformers
+
+        if Version(transformers.__version__) < Version("5.5.0"):
+            raise RuntimeError(
+                f"official MAGI-2 Qwen3.5 encoding requires transformers>=5.5.0; found {transformers.__version__}"
+            )
+        requested_device = torch.device(device)
+        device_index = torch.cuda.current_device() if requested_device.index is None else requested_device.index
+        torch.cuda.set_device(device_index)
+        self.device = torch.device("cuda", device_index)
+        resolved_device = str(self.device)
         repository_string = str(repository)
         if repository_string not in sys.path:
             sys.path.insert(0, repository_string)
@@ -336,14 +347,13 @@ class OfficialMagi2Encoders:
         vae_module = importlib.import_module("inference.model.vae2_2")
         audio_module = importlib.import_module("inference.pipeline.audio_decoder")
         text_module = importlib.import_module("inference.model.qwen35")
-        self.device = torch.device(device)
         self.video_vae = vae_module.get_vae2_2(
-            str(checkpoint / "vae/Wan2.2_VAE.pth"), device=device, weight_dtype=torch.float32
+            str(checkpoint / "vae/Wan2.2_VAE.pth"), device=resolved_device, weight_dtype=torch.float32
         )
         self.audio_vae = audio_module.SAAudioFeatureExtractor(str(checkpoint / "stable-audio-open-1.0"))
         self.text_encoder = text_module.Qwen35TextEncoder(
             str(checkpoint / "text_encoder"),
-            device=device,
+            device=resolved_device,
             precision=torch.bfloat16,
             max_length=text_max_length,
             skip_layer=2,
