@@ -96,11 +96,35 @@ excluded from the loss through an all-zero padding mask. Sigma and noise remain
 keyed by sample ID and optimizer step, independent of batch position or CP
 topology.
 
-This materialized dataset validates reading, sharding, collation, packing,
-communication, and checkpoint integration, but its tensor values are still
-synthetic rather than a scientific training corpus. A production data converter
-should write VAE/audio latents and text-encoder states into the same shard
-contract; the model and pretraining step do not need to be rewritten.
+This generated dataset validates reading, sharding, collation, packing,
+communication, and checkpoint integration, but its tensor values are synthetic.
+For real media, create a JSONL manifest with one object per sample:
+
+```json
+{"sample_id": 0, "split": "train", "video": "clip.mp4", "audio": "clip.wav", "text": "A prompt"}
+```
+
+Relative media paths are resolved from the JSONL directory. Encode it with the
+unmodified public video VAE, Stable Audio VAE, and Qwen3.5 text encoder:
+
+```bash
+uv run --extra diffusion python scripts/training/prepare_magi2_media_latents.py \
+  --input-manifest /path/to/media.jsonl \
+  --output-dir /path/to/magi2-official-latents \
+  --official-repo /path/to/MAGI-2-preview \
+  --checkpoint-root /path/to/MAGI-2-preview/ckpt
+```
+
+Only encoder weights are required: `vae/Wan2.2_VAE.pth`,
+`stable-audio-open-1.0/{model_config.json,model.safetensors}`, and the complete
+`text_encoder/` directory. They total roughly 64 GB in the public release; the
+228 GB preview transformer is not used by preprocessing. The converter samples
+8k+1 video frames at the official 25 fps, center-crops to a 32-aligned
+resolution, aligns stereo audio to the same duration, calls the official
+encoders directly, reproduces the preview token order and nine-field RoPE
+coordinates, and streams shards in the same `magi2-latent-v1` contract.
+Training therefore uses the same `--latent-dataset` argument for synthetic
+bring-up and real encoded media.
 
 For topology-independent integration comparisons, synthetic sigma and noise are
 derived from the sample ID and optimizer step. Repartitioning the same global

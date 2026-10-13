@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 from unittest.mock import Mock
 
@@ -35,6 +36,7 @@ from megatron.bridge.diffusion.models.magi2.data import (
     generate_magi2_latent_sample,
     magi2_latent_collate,
     write_magi2_latent_dataset,
+    write_magi2_precomputed_latent_dataset,
 )
 from megatron.bridge.diffusion.models.magi2.magi2_step import (
     magi2_deterministic_flow_random,
@@ -43,6 +45,10 @@ from megatron.bridge.diffusion.models.magi2.magi2_step import (
     magi2_prepare_flow_inputs,
     magi2_timestep_embedding,
     partition_magi2_batch_for_context_parallel,
+)
+from megatron.bridge.diffusion.models.magi2.media_preprocessing import (
+    magi2_latents_to_sample,
+    read_magi2_media_manifest,
 )
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 from megatron.bridge.recipes.magi2.h100.magi2 import (
@@ -234,6 +240,90 @@ def test_disk_latent_dataset_roundtrip_and_variable_length_collate(tmp_path):
     assert batch["coordinates"].shape == (8, 9)
     assert batch["cu_seqlens"].tolist() == [0, 3, 8]
     assert batch["sample_id"].tolist() == [10, 11]
+
+
+def test_official_latents_pack_with_preview_token_order_and_coordinates():
+    video = torch.arange(8, dtype=torch.float32).reshape(2, 2, 1, 2)
+    audio = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    text = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    sample = magi2_latents_to_sample(
+        video,
+        audio,
+        text,
+        sample_id=7,
+        storage_dtype=torch.float32,
+        expected_channels={"video": 2, "audio": 3, "text": 4},
+    )
+
+    assert sample["clean_inputs"].shape == (9, 4)
+    torch.testing.assert_close(sample["clean_inputs"][0], torch.tensor([0.0, 4.0, 0.0, 0.0]))
+    assert sample["modality_mapping"].tolist() == [
+        Magi2Modality.VIDEO,
+        Magi2Modality.VIDEO,
+        Magi2Modality.VIDEO,
+        Magi2Modality.VIDEO,
+        Magi2Modality.AUDIO,
+        Magi2Modality.AUDIO,
+        Magi2Modality.AUDIO,
+        Magi2Modality.TEXT,
+        Magi2Modality.TEXT,
+    ]
+    torch.testing.assert_close(sample["coordinates"][0], torch.tensor([0.0, 0.0, 0.0, 2.0, 1.0, 2.0, 2.0, 1.0, 2.0]))
+    torch.testing.assert_close(sample["coordinates"][4], torch.tensor([0.0, 0.0, 0.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
+    torch.testing.assert_close(sample["coordinates"][7], torch.tensor([-2.0, 0.0, 0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0]))
+
+
+def test_precomputed_latent_writer_streams_shards_and_records_observed_ranges(tmp_path):
+    first = magi2_latents_to_sample(
+        torch.zeros(2, 1, 1, 2),
+        torch.zeros(3, 3),
+        torch.zeros(2, 4),
+        sample_id=10,
+        storage_dtype=torch.float32,
+    )
+    second = magi2_latents_to_sample(
+        torch.zeros(2, 2, 1, 2),
+        torch.zeros(5, 3),
+        torch.zeros(1, 4),
+        sample_id=11,
+        storage_dtype=torch.float32,
+    )
+    dataset_root = tmp_path / "precomputed"
+
+    manifest_path = write_magi2_precomputed_latent_dataset(
+        dataset_root,
+        {"train": iter((first, second))},
+        channels={"video": 2, "audio": 3, "text": 4},
+        shard_size=1,
+        metadata={"source": "unit-test"},
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["token_ranges"] == {"video": [2, 4], "audio": [3, 5], "text": [1, 2]}
+    assert manifest["max_tokens_per_sample"] == 11
+    assert manifest["metadata"] == {"source": "unit-test"}
+    assert len(tuple(dataset_root.glob("train-*.pt"))) == 2
+    dataset = Magi2DiskLatentDataset(dataset_root, "train")
+    assert [dataset[index]["sample_id"].item() for index in range(2)] == [10, 11]
+
+
+def test_media_manifest_resolves_relative_paths_and_rejects_duplicate_ids(tmp_path):
+    (tmp_path / "clip.mp4").touch()
+    (tmp_path / "clip.wav").touch()
+    manifest_path = tmp_path / "media.jsonl"
+    record = {"sample_id": 3, "split": "train", "video": "clip.mp4", "audio": "clip.wav", "text": "test"}
+    manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    records = read_magi2_media_manifest(manifest_path)
+
+    assert records[0].sample_id == 3
+    assert records[0].video_path == (tmp_path / "clip.mp4").resolve()
+    assert records[0].audio_path == (tmp_path / "clip.wav").resolve()
+
+    manifest_path.write_text(json.dumps(record) + "\n" + json.dumps(record) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate sample_id"):
+        read_magi2_media_manifest(manifest_path)
 
 
 def test_time_embedding_matches_official_magi2_definition():

@@ -21,6 +21,7 @@ from megatron.bridge.diffusion.models.magi2.data import (
     generate_magi2_latent_sample,
     magi2_latent_collate,
     write_magi2_latent_dataset,
+    write_magi2_precomputed_latent_dataset,
 )
 from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
@@ -35,4 +36,5 @@ __all__ = [
     "generate_magi2_latent_sample",
     "magi2_latent_collate",
     "write_magi2_latent_dataset",
+    "write_magi2_precomputed_latent_dataset",
 ]
