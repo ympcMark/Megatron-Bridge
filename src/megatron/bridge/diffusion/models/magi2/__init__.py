@@ -15,8 +15,12 @@
 """Bridge training integration for MCore's native MAGI-2 model."""
 
 from megatron.bridge.diffusion.models.magi2.data import (
+    Magi2DiskLatentDataset,
     Magi2LatentDataset,
     Magi2LatentDatasetConfig,
+    generate_magi2_latent_sample,
+    magi2_latent_collate,
+    write_magi2_latent_dataset,
 )
 from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
@@ -24,7 +28,11 @@ from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 
 __all__ = [
     "Magi2ForwardStep",
+    "Magi2DiskLatentDataset",
     "Magi2LatentDataset",
     "Magi2LatentDatasetConfig",
     "Magi2ModelProvider",
+    "generate_magi2_latent_sample",
+    "magi2_latent_collate",
+    "write_magi2_latent_dataset",
 ]

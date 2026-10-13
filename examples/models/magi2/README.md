@@ -68,13 +68,39 @@ continues an existing run.
 
 ## Data boundary
 
-`Magi2LatentDatasetConfig` intentionally supplies deterministic synthetic packed
-latents and text conditioning. It validates model, optimizer, communication, and
-checkpoint integration but is not a scientific corpus-training dataset. A
-production run should replace only this DatasetProvider with a provider that
-emits VAE/audio latents, text-encoder states, 3-axis coordinates, and modality
-IDs using the same batch keys. The model and pretraining step do not need to be
-rewritten.
+Without an explicit data path, `Magi2LatentDatasetConfig` supplies deterministic
+in-memory latents and text conditioning as a minimal smoke fallback. To exercise
+the real DataLoader boundary, first materialize variable-length latent shards:
+
+```bash
+uv run python scripts/training/generate_magi2_latent_dataset.py \
+  --output-dir /path/to/magi2-latents \
+  --train-samples 64 --valid-samples 16
+```
+
+Then pass the directory to training:
+
+```bash
+uv run python -m torch.distributed.run --nproc_per_node=4 \
+  examples/models/magi2/pretrain_magi2.py \
+  --smoke --latent-dataset /path/to/magi2-latents \
+  --checkpoint-dir /path/to/checkpoints --loss-output /path/to/loss.jsonl
+```
+
+The `magi2-latent-v1` manifest describes channel widths, token ranges, splits,
+and shards. The collator concatenates variable-length examples into one physical
+THD stream and emits logical `cu_seqlens`, so attention cannot cross sample
+boundaries. With CP enabled, every logical sample is padded independently to a
+multiple of `2 * CP`, partitioned with MCore's per-document zigzag layout, and
+excluded from the loss through an all-zero padding mask. Sigma and noise remain
+keyed by sample ID and optimizer step, independent of batch position or CP
+topology.
+
+This materialized dataset validates reading, sharding, collation, packing,
+communication, and checkpoint integration, but its tensor values are still
+synthetic rather than a scientific training corpus. A production data converter
+should write VAE/audio latents and text-encoder states into the same shard
+contract; the model and pretraining step do not need to be rewritten.
 
 For topology-independent integration comparisons, synthetic sigma and noise are
 derived from the sample ID and optimizer step. Repartitioning the same global

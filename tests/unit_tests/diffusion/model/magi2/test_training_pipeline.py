@@ -29,9 +29,16 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 
 import megatron.bridge.diffusion.models.magi2.magi2_step as step_module
 import megatron.bridge.diffusion.models.magi2.provider as provider_module
-from megatron.bridge.diffusion.models.magi2.data import Magi2LatentDataset
+from megatron.bridge.diffusion.models.magi2.data import (
+    Magi2DiskLatentDataset,
+    Magi2LatentDataset,
+    generate_magi2_latent_sample,
+    magi2_latent_collate,
+    write_magi2_latent_dataset,
+)
 from megatron.bridge.diffusion.models.magi2.magi2_step import (
     magi2_deterministic_flow_random,
+    magi2_deterministic_packed_flow_random,
     magi2_flow_loss,
     magi2_prepare_flow_inputs,
     magi2_timestep_embedding,
@@ -179,6 +186,56 @@ def test_latent_dataset_is_reproducible_and_uses_public_channel_widths():
     assert not torch.any(first["modality_mapping"] == Magi2Modality.TIME)
 
 
+def test_disk_latent_dataset_roundtrip_and_variable_length_collate(tmp_path):
+    dataset_root = tmp_path / "latents"
+    write_magi2_latent_dataset(
+        dataset_root,
+        train_samples=5,
+        valid_samples=2,
+        shard_size=2,
+        seed=17,
+        video_token_range=(1, 3),
+        audio_token_range=(1, 2),
+        text_token_range=(1, 2),
+        video_in_channels=2,
+        audio_in_channels=3,
+        text_in_channels=4,
+    )
+
+    dataset = Magi2DiskLatentDataset(dataset_root, "train")
+    assert len(dataset) == 5
+    torch.testing.assert_close(dataset[0]["clean_inputs"], dataset[0]["clean_inputs"])
+    assert dataset[-1]["sample_id"].item() == 4
+    assert len(tuple(dataset_root.glob("train-*.pt"))) == 3
+
+    short = generate_magi2_latent_sample(
+        10,
+        seed=1,
+        video_tokens=1,
+        audio_tokens=1,
+        text_tokens=1,
+        video_in_channels=2,
+        audio_in_channels=3,
+        text_in_channels=4,
+    )
+    long = generate_magi2_latent_sample(
+        11,
+        seed=1,
+        video_tokens=2,
+        audio_tokens=2,
+        text_tokens=1,
+        video_in_channels=2,
+        audio_in_channels=3,
+        text_in_channels=4,
+    )
+    batch = magi2_latent_collate([short, long])
+
+    assert batch["clean_inputs"].shape == (8, 4)
+    assert batch["coordinates"].shape == (8, 9)
+    assert batch["cu_seqlens"].tolist() == [0, 3, 8]
+    assert batch["sample_id"].tolist() == [10, 11]
+
+
 def test_time_embedding_matches_official_magi2_definition():
     timesteps = torch.tensor([0.0, 0.25, 1.0])
     embedding = magi2_timestep_embedding(timesteps, 64)
@@ -248,6 +305,21 @@ def test_synthetic_flow_random_is_stable_per_sample_and_step():
     assert not torch.equal(first[1], next_step[1])
 
 
+def test_packed_flow_random_is_stable_for_variable_length_samples():
+    clean = torch.zeros(8, 4)
+    sample_ids = torch.tensor([10, 11])
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    first = magi2_deterministic_packed_flow_random(clean, sample_ids, cu_seqlens, step=2, seed=42)
+    repeated = magi2_deterministic_packed_flow_random(clean, sample_ids, cu_seqlens, step=2, seed=42)
+
+    torch.testing.assert_close(first[0], repeated[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(first[1], repeated[1], rtol=0.0, atol=0.0)
+    assert first[0][:3].unique().numel() == 1
+    assert first[0][3:].unique().numel() == 1
+    assert first[0][0] != first[0][3]
+
+
 def test_timestep_embedding_and_flow_loss_are_finite():
     embedding = magi2_timestep_embedding(torch.tensor([0.25, 0.75]), 9)
     squared_error = torch.tensor([[1.0, 4.0], [9.0, 16.0]])
@@ -265,24 +337,36 @@ def test_timestep_embedding_and_flow_loss_are_finite():
 def test_context_parallel_partition_pads_each_sample_and_masks_padding(monkeypatch):
     cp_group = Mock()
     cp_group.size.return_value = 2
-    indices = torch.tensor([0, 3])
+    indices = torch.tensor([0, 3, 4, 7, 8, 11])
     partition = Mock(return_value=indices)
     monkeypatch.setattr(step_module, "get_thd_cp_partition_indices", partition)
-    mapping = torch.tensor([[Magi2Modality.VIDEO, Magi2Modality.AUDIO, Magi2Modality.TEXT]])
-    values = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
+    mapping = torch.tensor(
+        [
+            Magi2Modality.VIDEO,
+            Magi2Modality.AUDIO,
+            Magi2Modality.TEXT,
+            Magi2Modality.VIDEO,
+            Magi2Modality.VIDEO,
+            Magi2Modality.AUDIO,
+            Magi2Modality.AUDIO,
+            Magi2Modality.TEXT,
+        ]
+    )
+    values = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
 
     local, logical, physical, split_sizes, global_indices = partition_magi2_batch_for_context_parallel(
         {"values": values, "modality_mapping": mapping},
-        sequence_length=3,
+        cu_seqlens=cu_seqlens,
         cp_group=cp_group,
     )
 
-    assert logical.tolist() == [0, 3]
-    assert physical.tolist() == [0, 4]
-    assert split_sizes.tolist() == [2, 2]
-    assert global_indices.tolist() == [0, 3]
-    assert local["values"].shape == (2, 2)
-    assert local["modality_mapping"].tolist() == [0, 2]
+    assert logical.tolist() == [0, 3, 8]
+    assert physical.tolist() == [0, 4, 12]
+    assert split_sizes.tolist() == [6, 6]
+    assert global_indices.tolist() == [0, 3, 4, 7, 8, 11]
+    assert local["values"].shape == (6, 2)
+    assert local["modality_mapping"].tolist() == [0, 2, 0, 1, 2, 2]
     partition.assert_called_once()
 
 

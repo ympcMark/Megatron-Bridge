@@ -106,19 +106,58 @@ def magi2_deterministic_flow_random(
         raise ValueError("clean_inputs must have shape [batch, tokens, channels]")
     if sample_ids.numel() != clean_inputs.shape[0]:
         raise ValueError("sample_ids must contain one identifier per sample")
-    sigmas = torch.empty(clean_inputs.shape[0], device=clean_inputs.device)
+    sequence_length = clean_inputs.shape[1]
+    cu_seqlens = torch.arange(
+        0,
+        (clean_inputs.shape[0] + 1) * sequence_length,
+        sequence_length,
+        dtype=torch.int32,
+        device=clean_inputs.device,
+    )
+    token_sigmas, noise = magi2_deterministic_packed_flow_random(
+        clean_inputs.reshape(-1, clean_inputs.shape[-1]),
+        sample_ids,
+        cu_seqlens,
+        step=step,
+        seed=seed,
+    )
+    sigmas = token_sigmas.index_select(0, cu_seqlens[:-1].long())
+    return sigmas, noise.view_as(clean_inputs)
+
+
+def magi2_deterministic_packed_flow_random(
+    clean_inputs: Tensor,
+    sample_ids: Tensor,
+    cu_seqlens: Tensor,
+    *,
+    step: int,
+    seed: int,
+) -> tuple[Tensor, Tensor]:
+    """Generate one deterministic sigma and noise stream per packed sample."""
+    if clean_inputs.ndim != 2:
+        raise ValueError("packed clean_inputs must have shape [tokens, channels]")
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() != sample_ids.numel() + 1:
+        raise ValueError("cu_seqlens must contain one boundary per sample plus the terminal boundary")
+    boundaries = tuple(int(item) for item in cu_seqlens.cpu().tolist())
+    if boundaries[0] != 0 or boundaries[-1] != clean_inputs.shape[0]:
+        raise ValueError("cu_seqlens must cover the full packed clean-input stream")
+    if any(start >= end for start, end in zip(boundaries[:-1], boundaries[1:])):
+        raise ValueError("every packed MAGI-2 sample must contain at least one token")
+
+    token_sigmas = torch.empty(clean_inputs.shape[0], device=clean_inputs.device)
     noise = torch.empty_like(clean_inputs)
-    for batch_index, sample_id in enumerate(sample_ids.reshape(-1).cpu().tolist()):
+    for sample_id, start, end in zip(sample_ids.reshape(-1).cpu().tolist(), boundaries[:-1], boundaries[1:]):
         generator = torch.Generator(device=clean_inputs.device)
         generator.manual_seed(seed + int(sample_id) * 1_000_003 + step * 10_000_019)
-        sigmas[batch_index] = torch.rand((), generator=generator, device=clean_inputs.device)
-        noise[batch_index] = torch.randn(
-            clean_inputs.shape[1:],
+        sigma = torch.rand((), generator=generator, device=clean_inputs.device)
+        token_sigmas[start:end] = sigma
+        noise[start:end] = torch.randn(
+            (end - start, clean_inputs.shape[1]),
             generator=generator,
             device=clean_inputs.device,
             dtype=clean_inputs.dtype,
         )
-    return sigmas, noise
+    return token_sigmas, noise
 
 
 def magi2_flow_loss(
@@ -131,18 +170,26 @@ def magi2_flow_loss(
     return loss_sum, active_elements, {"flow_mse": torch.stack((loss_sum.detach(), active_elements.detach().float()))}
 
 
-def _pad_sequence_tensor(tensor: Tensor, padded_sequence_length: int, fill_value: float = 0) -> Tensor:
-    """Pad every sample on its sequence axis and flatten it into one THD stream."""
-    batch_size, sequence_length = tensor.shape[:2]
-    padded = tensor.new_full((batch_size, padded_sequence_length, *tensor.shape[2:]), fill_value)
-    padded[:, :sequence_length] = tensor
-    return padded.reshape(batch_size * padded_sequence_length, *tensor.shape[2:])
+def _pad_packed_sequence_tensor(
+    tensor: Tensor,
+    logical_boundaries: tuple[int, ...],
+    padded_lengths: tuple[int, ...],
+    fill_value: float = 0,
+) -> Tensor:
+    """Pad every logical THD sequence independently and preserve its boundaries."""
+    segments = []
+    for start, end, padded_length in zip(logical_boundaries[:-1], logical_boundaries[1:], padded_lengths):
+        segment = tensor[start:end]
+        padded = tensor.new_full((padded_length, *tensor.shape[1:]), fill_value)
+        padded[: end - start] = segment
+        segments.append(padded)
+    return torch.cat(segments, dim=0)
 
 
 def partition_magi2_batch_for_context_parallel(
     tensors: dict[str, Tensor],
     *,
-    sequence_length: int,
+    cu_seqlens: Tensor,
     cp_group: torch.distributed.ProcessGroup,
 ) -> tuple[dict[str, Tensor], Tensor, Tensor, Tensor, Tensor]:
     """Pad and partition token-aligned MAGI-2 tensors with MCore's THD CP layout."""
@@ -150,34 +197,36 @@ def partition_magi2_batch_for_context_parallel(
     if cp_size <= 1:
         raise ValueError("context-parallel partitioning requires CP size greater than one")
     alignment = 2 * cp_size
-    padded_sequence_length = math.ceil(sequence_length / alignment) * alignment
-    batch_size = next(iter(tensors.values())).shape[0]
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError("cu_seqlens must contain at least one packed sequence")
+    logical_boundaries = tuple(int(item) for item in cu_seqlens.cpu().tolist())
+    total_tokens = logical_boundaries[-1]
+    if logical_boundaries[0] != 0 or any(
+        start >= end for start, end in zip(logical_boundaries[:-1], logical_boundaries[1:])
+    ):
+        raise ValueError("cu_seqlens must describe non-empty monotonically increasing sequences")
+    if any(tensor.shape[0] != total_tokens for tensor in tensors.values()):
+        raise ValueError("all token-aligned tensors must match the logical packed token count")
+    logical_lengths = tuple(end - start for start, end in zip(logical_boundaries[:-1], logical_boundaries[1:]))
+    padded_lengths = tuple(math.ceil(length / alignment) * alignment for length in logical_lengths)
     padded_tensors = {
-        name: _pad_sequence_tensor(
+        name: _pad_packed_sequence_tensor(
             tensor,
-            padded_sequence_length,
+            logical_boundaries,
+            padded_lengths,
             fill_value=(Magi2Modality.TEXT if name == "modality_mapping" else 0),
         )
         for name, tensor in tensors.items()
     }
-    cu_seqlens = torch.arange(
-        0,
-        (batch_size + 1) * sequence_length,
-        sequence_length,
+    cu_seqlens_padded = torch.tensor(
+        (0, *torch.tensor(padded_lengths, dtype=torch.int64).cumsum(0).tolist()),
         dtype=torch.int32,
         device=next(iter(tensors.values())).device,
     )
-    cu_seqlens_padded = torch.arange(
-        0,
-        (batch_size + 1) * padded_sequence_length,
-        padded_sequence_length,
-        dtype=torch.int32,
-        device=cu_seqlens.device,
-    )
-    total_tokens = batch_size * padded_sequence_length
+    physical_token_count = int(cu_seqlens_padded[-1].item())
     indices = get_thd_cp_partition_indices(
         cu_seqlens_padded,
-        total_tokens=total_tokens,
+        total_tokens=physical_token_count,
         cp_group=cp_group,
         device=cu_seqlens.device,
     )
@@ -188,7 +237,7 @@ def partition_magi2_batch_for_context_parallel(
         dtype=torch.int32,
         device=cu_seqlens.device,
     )
-    return local_tensors, cu_seqlens, cu_seqlens_padded, cp_split_sizes, indices
+    return local_tensors, cu_seqlens.to(torch.int32), cu_seqlens_padded, cp_split_sizes, indices
 
 
 class Magi2ForwardStep:
@@ -213,26 +262,36 @@ class Magi2ForwardStep:
         clean_inputs = batch["clean_inputs"]
         coordinates = batch["coordinates"]
         modality_mapping = batch["modality_mapping"]
-        batch_size, sequence_length, input_width = clean_inputs.shape
-        flattened_clean = clean_inputs.reshape(-1, input_width)
-        flattened_coordinates = coordinates.reshape(-1, coordinates.shape[-1])
-        flattened_mapping = modality_mapping.reshape(-1)
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * sequence_length,
-            sequence_length,
-            dtype=torch.int32,
-            device=clean_inputs.device,
-        )
+        if clean_inputs.ndim == 3:
+            batch_size, sequence_length, input_width = clean_inputs.shape
+            flattened_clean = clean_inputs.reshape(-1, input_width)
+            flattened_coordinates = coordinates.reshape(-1, coordinates.shape[-1])
+            flattened_mapping = modality_mapping.reshape(-1)
+            cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * sequence_length,
+                sequence_length,
+                dtype=torch.int32,
+                device=clean_inputs.device,
+            )
+        elif clean_inputs.ndim == 2:
+            flattened_clean = clean_inputs
+            flattened_coordinates = coordinates
+            flattened_mapping = modality_mapping
+            cu_seqlens = batch.get("cu_seqlens")
+            if cu_seqlens is None:
+                raise ValueError("packed MAGI-2 batches must provide cu_seqlens")
+        else:
+            raise ValueError("clean_inputs must have shape [tokens, channels] or [batch, tokens, channels]")
 
         cp_group = get_pg_collection(model).cp
-        sigmas, noise = magi2_deterministic_flow_random(
-            clean_inputs,
+        token_sigmas, noise = magi2_deterministic_packed_flow_random(
+            flattened_clean,
             batch["sample_id"],
+            cu_seqlens,
             step=state.train_state.step,
             seed=state.cfg.rng.seed,
         )
-        token_sigmas = sigmas.repeat_interleave(sequence_length)
         model_inputs, target, loss_mask, time_token_sequence = magi2_prepare_flow_inputs(
             flattened_clean,
             flattened_mapping,
@@ -240,7 +299,7 @@ class Magi2ForwardStep:
             video_in_channels=state.cfg.model.magi2_video_in_channels,
             audio_in_channels=state.cfg.model.magi2_audio_in_channels,
             time_channel_dim=state.cfg.dataset.time_channel_dim,
-            noise=noise.reshape_as(flattened_clean),
+            noise=noise,
         )
 
         cu_seqlens_padded = None
@@ -250,14 +309,14 @@ class Magi2ForwardStep:
             token_tensors, cu_seqlens, cu_seqlens_padded, cp_split_sizes, cp_global_indices = (
                 partition_magi2_batch_for_context_parallel(
                     {
-                        "model_inputs": model_inputs.view(batch_size, sequence_length, -1),
-                        "target": target.view(batch_size, sequence_length, -1),
-                        "loss_mask": loss_mask.view(batch_size, sequence_length, -1),
-                        "coordinates": coordinates,
-                        "modality_mapping": modality_mapping,
-                        "time_token_sequence": time_token_sequence.view(batch_size, sequence_length, -1),
+                        "model_inputs": model_inputs,
+                        "target": target,
+                        "loss_mask": loss_mask,
+                        "coordinates": flattened_coordinates,
+                        "modality_mapping": flattened_mapping,
+                        "time_token_sequence": time_token_sequence,
                     },
-                    sequence_length=sequence_length,
+                    cu_seqlens=cu_seqlens,
                     cp_group=cp_group,
                 )
             )
@@ -286,6 +345,7 @@ __all__ = [
     "Magi2ForwardStep",
     "magi2_flow_loss",
     "magi2_deterministic_flow_random",
+    "magi2_deterministic_packed_flow_random",
     "magi2_prepare_flow_inputs",
     "magi2_timestep_embedding",
     "partition_magi2_batch_for_context_parallel",

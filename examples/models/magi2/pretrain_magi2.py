@@ -32,6 +32,7 @@ from megatron.core.models.magi2 import (
 )
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 
+from megatron.bridge.diffusion.models.magi2.data import MAGI2_LATENT_DATASET_FORMAT
 from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
 from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_config,
@@ -46,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     """Parse reproducible MAGI-2 training arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-iters", type=int, default=50)
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        help="Override the recipe micro-batch size; values above one exercise multi-sample THD collation.",
+    )
     parser.add_argument(
         "--lr-decay-iters",
         type=int,
@@ -70,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         "--official-checkpoint",
         type=Path,
         help="Initialize the native MCore model from the public MAGI-2 safetensors directory.",
+    )
+    parser.add_argument(
+        "--latent-dataset",
+        type=Path,
+        help="Read clean variable-length latents from a magi2-latent-v1 dataset directory.",
     )
     parser.add_argument("--router-bias-ema", type=float, default=0.999)
     parser.add_argument("--smoke", action="store_true")
@@ -216,6 +227,58 @@ def _apply_smoke_overrides(cfg, world_size: int) -> None:
     cfg.train.global_batch_size = world_size
 
 
+def _configure_disk_latent_dataset(cfg, dataset_path: Path, *, allow_channel_override: bool) -> dict:
+    """Validate a latent manifest and apply its static dimensions to the recipe."""
+    dataset_path = dataset_path.resolve()
+    manifest_path = dataset_path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"MAGI-2 latent manifest does not exist: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != MAGI2_LATENT_DATASET_FORMAT:
+        raise ValueError(
+            f"unsupported MAGI-2 latent format {manifest.get('format')!r}; expected {MAGI2_LATENT_DATASET_FORMAT!r}"
+        )
+    channels = manifest.get("channels")
+    if not isinstance(channels, dict) or set(channels) != {"video", "audio", "text"}:
+        raise ValueError(f"invalid channels mapping in latent manifest: {channels!r}")
+    channels = {name: int(width) for name, width in channels.items()}
+    if any(width <= 0 for width in channels.values()):
+        raise ValueError(f"latent channel widths must be positive: {channels}")
+    expected_channels = {
+        "video": cfg.model.magi2_video_in_channels,
+        "audio": cfg.model.magi2_audio_in_channels,
+        "text": cfg.model.magi2_text_in_channels,
+    }
+    if channels != expected_channels:
+        if not allow_channel_override:
+            raise ValueError(f"latent channels {channels} do not match model channels {expected_channels}")
+        for modality, channels_field in (
+            ("video", "magi2_video_in_channels"),
+            ("audio", "magi2_audio_in_channels"),
+            ("text", "magi2_text_in_channels"),
+        ):
+            setattr(cfg.model, channels_field, int(channels[modality]))
+            setattr(cfg.dataset, channels_field.removeprefix("magi2_"), int(channels[modality]))
+    token_ranges = manifest.get("token_ranges", {})
+    maxima = {}
+    for modality in ("video", "audio", "text"):
+        bounds = token_ranges.get(modality)
+        if not isinstance(bounds, list) or len(bounds) != 2 or int(bounds[0]) <= 0 or int(bounds[1]) < int(bounds[0]):
+            raise ValueError(f"invalid {modality} token range in latent manifest: {bounds!r}")
+        maxima[modality] = int(bounds[1])
+    max_tokens = sum(maxima.values())
+    if int(manifest.get("max_tokens_per_sample", -1)) != max_tokens:
+        raise ValueError("latent manifest max_tokens_per_sample does not match its token ranges")
+
+    cfg.dataset.data_path = dataset_path
+    cfg.dataset.seed = int(manifest["seed"])
+    cfg.dataset.video_tokens = maxima["video"]
+    cfg.dataset.audio_tokens = maxima["audio"]
+    cfg.dataset.text_tokens = maxima["text"]
+    cfg.model.seq_length = max_tokens
+    return manifest
+
+
 def _apply_context_parallel_overrides(cfg, context_parallel_size: int, cp_comm_type: str) -> None:
     if context_parallel_size <= 0:
         raise ValueError("context-parallel-size must be positive")
@@ -236,6 +299,8 @@ def main() -> None:
     args = parse_args()
     if args.train_iters <= 0 or args.save_interval <= 0:
         raise ValueError("train-iters and save-interval must be positive")
+    if args.micro_batch_size is not None and args.micro_batch_size <= 0:
+        raise ValueError("micro-batch-size must be positive")
     if args.exit_interval is not None and args.exit_interval <= 0:
         raise ValueError("exit-interval must be positive")
     if args.load is not None and args.official_checkpoint is not None:
@@ -264,8 +329,13 @@ def main() -> None:
     cfg = recipe()
     if args.smoke:
         _apply_smoke_overrides(cfg, world_size)
+    latent_manifest = None
+    if args.latent_dataset is not None:
+        latent_manifest = _configure_disk_latent_dataset(cfg, args.latent_dataset, allow_channel_override=args.smoke)
     _apply_context_parallel_overrides(cfg, args.context_parallel_size, args.cp_comm_type)
     cfg.train.train_iters = args.train_iters
+    if args.micro_batch_size is not None:
+        cfg.train.micro_batch_size = args.micro_batch_size
     cfg.train.exit_interval = args.exit_interval
     cfg.scheduler.lr_decay_iters = args.lr_decay_iters or args.train_iters
     cfg.checkpoint.save = None if args.no_save else str(args.checkpoint_dir.resolve())
@@ -337,9 +407,15 @@ def main() -> None:
                 ),
             },
             "data": {
-                "kind": "deterministic synthetic latent integration data",
+                "kind": (
+                    "disk-backed variable-length latent integration data"
+                    if latent_manifest is not None
+                    else "deterministic synthetic latent integration data"
+                ),
+                "path": None if args.latent_dataset is None else str(args.latent_dataset.resolve()),
                 "seed": cfg.dataset.seed,
                 "tokens_per_sample": cfg.dataset.video_tokens + cfg.dataset.audio_tokens + cfg.dataset.text_tokens,
+                "token_ranges": None if latent_manifest is None else latent_manifest["token_ranges"],
                 "video_channels": cfg.dataset.video_in_channels,
                 "audio_channels": cfg.dataset.audio_in_channels,
                 "text_channels": cfg.dataset.text_in_channels,
