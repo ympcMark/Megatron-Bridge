@@ -56,6 +56,7 @@ from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
     magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config,
 )
+from megatron.bridge.training.utils.theoretical_memory_utils import estimate_training_memory
 
 
 pytestmark = [pytest.mark.unit]
@@ -91,6 +92,13 @@ def test_original_fsdp_recipe_uses_fully_sharded_dtensor_contract():
     assert cfg.model.recompute_method == "uniform"
     assert cfg.model.recompute_num_layers == 1
     assert cfg.model.recompute_modules is None
+
+    estimate = estimate_training_memory(cfg, include_activation=False)
+    dense_component, routed_component = estimate.model_state_components
+    assert dense_component.parameter_count == 5_218_372_656
+    assert routed_component.parameter_count == 108_716_359_680
+    assert routed_component.parameter_count_per_gpu == 1_698_693_120
+    assert estimate.total_parameters == 113_934_732_336
 
 
 def test_original_fsdp_cp2_recipe_uses_per_element_global_normalization():

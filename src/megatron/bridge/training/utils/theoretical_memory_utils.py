@@ -433,6 +433,10 @@ def _compute_activation_memory_bytes(
 
 
 def _count_parameters(model_config: object) -> _ParameterCounts:
+    magi2_counts = _count_magi2_parameters(model_config)
+    if magi2_counts is not None:
+        return magi2_counts
+
     hidden_size = model_config.hidden_size
     moe_layer_pattern = _get_moe_layer_pattern(model_config)
     ffn_projection_factor = _ffn_projection_factor(model_config)
@@ -507,6 +511,49 @@ def _count_parameters(model_config: object) -> _ParameterCounts:
         dense_transformer_by_layer=dense_transformer_by_layer,
         routed_experts_by_layer=routed_experts_by_layer,
         final_layernorm=final_layernorm_parameters,
+    )
+
+
+def _count_magi2_parameters(model_config: object) -> _ParameterCounts | None:
+    """Use MAGI-2's native logical count instead of a full-hidden MoE estimate.
+
+    MAGI-2 routes one ``hidden_size / moe_heads`` slice through each expert.
+    The generic estimator assumes every expert consumes the complete hidden
+    state and consequently over-counts routed parameters by the number of MoE
+    heads. MCore owns the architecture formula, so consume its breakdown when
+    available. MAGI-2 currently supports PP1 only; per-layer accounting can be
+    added alongside pipeline parallel model support.
+    """
+    count_breakdown = getattr(model_config, "magi2_parameter_count_breakdown", None)
+    if not callable(count_breakdown):
+        return None
+    if _positive_int_attr(model_config, "pipeline_model_parallel_size", 1) != 1:
+        return None
+
+    breakdown = count_breakdown()
+    routed_experts = float(breakdown["routed_experts"])
+    dense_and_adapters = float(sum(count for name, count in breakdown.items() if name != "routed_experts"))
+
+    hidden_size = _positive_int_attr(model_config, "hidden_size", 1)
+    embedding_parameters = float(hidden_size * _get_vocab_size(model_config))
+    if not model_config.share_embeddings_and_output_weights:
+        embedding_parameters *= 2
+    dense_transformer = dense_and_adapters - embedding_parameters
+    if dense_transformer < 0:
+        raise ValueError("MAGI-2 parameter breakdown is smaller than the configured embedding estimate")
+
+    num_layers = _positive_int_attr(model_config, "num_layers", 1)
+    moe_layers = set(getattr(model_config, "magi2_moe_layers", ()))
+    routed_per_moe_layer = routed_experts / len(moe_layers) if moe_layers else 0.0
+    return _ParameterCounts(
+        dense_transformer=dense_transformer,
+        routed_experts=routed_experts,
+        embeddings=embedding_parameters,
+        dense_transformer_by_layer=(dense_transformer / num_layers,) * num_layers,
+        routed_experts_by_layer=tuple(
+            routed_per_moe_layer if layer_idx in moe_layers else 0.0 for layer_idx in range(num_layers)
+        ),
+        final_layernorm=0.0,
     )
 
 
