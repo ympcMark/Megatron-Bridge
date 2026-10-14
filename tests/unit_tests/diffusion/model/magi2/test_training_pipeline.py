@@ -87,6 +87,10 @@ def test_original_fsdp_recipe_uses_fully_sharded_dtensor_contract():
     assert cfg.ddp.megatron_fsdp_grad_comm_dtype == torch.float32
     assert not cfg.ddp.average_in_collective
     assert cfg.checkpoint.ckpt_format == "fsdp_dtensor"
+    assert cfg.model.recompute_granularity == "full"
+    assert cfg.model.recompute_method == "uniform"
+    assert cfg.model.recompute_num_layers == 1
+    assert cfg.model.recompute_modules is None
 
 
 def test_original_fsdp_cp2_recipe_uses_per_element_global_normalization():

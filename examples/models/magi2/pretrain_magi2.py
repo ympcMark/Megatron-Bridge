@@ -194,6 +194,9 @@ def _step_callback(
 
 def _apply_smoke_overrides(cfg, world_size: int) -> None:
     cfg.model.require_original_size = False
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_method = None
+    cfg.model.recompute_num_layers = None
     cfg.model.num_layers = 2
     cfg.model.hidden_size = 64
     cfg.model.num_attention_heads = 4
@@ -399,6 +402,9 @@ def main() -> None:
                 "megatron_fsdp_version": cfg.ddp.megatron_fsdp_version,
                 "data_parallel_sharding_strategy": cfg.ddp.data_parallel_sharding_strategy,
                 "expert_data_parallel_sharding_strategy": cfg.ddp.expert_data_parallel_sharding_strategy,
+                "recompute_granularity": cfg.model.recompute_granularity,
+                "recompute_method": cfg.model.recompute_method,
+                "recompute_num_layers": cfg.model.recompute_num_layers,
                 "save_interval": cfg.checkpoint.save_interval,
                 "save": cfg.checkpoint.save,
                 "load": None if args.load is None else str(args.load.resolve()),

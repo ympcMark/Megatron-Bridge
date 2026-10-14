@@ -38,6 +38,13 @@ def magi2_114b_pretrain_64gpu_h100_bf16_config() -> ConfigContainer:
     cfg.model.pipeline_model_parallel_size = 1
     cfg.model.context_parallel_size = 1
     cfg.model.sequence_parallel = False
+    # The official 2,027-token latent sequence does not fit on H100 when all
+    # 40 layers retain their forward activations. Recompute one complete layer
+    # at a time during backward without changing model or routing semantics.
+    cfg.model.recompute_granularity = "full"
+    cfg.model.recompute_method = "uniform"
+    cfg.model.recompute_num_layers = 1
+    cfg.model.recompute_modules = None
     cfg.dataset = Magi2LatentDatasetConfig()
     cfg.train.train_iters = 50
     cfg.train.global_batch_size = 64
