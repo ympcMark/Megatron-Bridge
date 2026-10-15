@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -61,6 +61,8 @@ class GlobalFlopsRuntimeStats:
         vision_merged_token_sum: Exact sum of post-merger vision tokens.
         cross_seqlen_sum: Total cross-attention key/value length.
         cross_seqlen_product_sum: Sum of query/key-value length products.
+        model_specific_stats: Named additive statistics requested by a custom
+            model FLOPs estimator.
     """
 
     seqlen_sum: int | None
@@ -71,6 +73,7 @@ class GlobalFlopsRuntimeStats:
     vision_merged_token_sum: int = 0
     cross_seqlen_sum: int | None = None
     cross_seqlen_product_sum: int | None = None
+    model_specific_stats: dict[str, int] = field(default_factory=dict)
 
     @property
     def has_exact_vision_stats(self) -> bool:
@@ -140,6 +143,7 @@ def resolve_global_flops_runtime_stats(
     dp_group=None,
     include_vision_patch_stats: bool = False,
     include_cross_attention_stats: bool = False,
+    model_specific_stat_names: tuple[str, ...] = (),
 ) -> GlobalFlopsRuntimeStats:
     """Resolve all data-parallel-global FLOPS statistics used by training.
 
@@ -174,6 +178,9 @@ def resolve_global_flops_runtime_stats(
             optional cross-attention values. This must be uniform across every
             rank in ``dp_group``; callers should derive it from model capability,
             not local batch contents.
+        model_specific_stat_names: Additive custom statistics required by the
+            active model estimator. Values are accumulated under
+            ``_flops_model_specific_<name>`` by the forward step.
 
     Returns:
         Global statistics with sequence values set to ``None`` when no
@@ -188,6 +195,10 @@ def resolve_global_flops_runtime_stats(
     local_vision_merged_token_sum = _accumulator_to_int(getattr(state, "_flops_vision_merged_token_sum", 0))
     local_cross_seqlen_sum = _accumulator_to_int(getattr(state, "_flops_cross_seqlen_sum", 0))
     local_cross_seqlen_product_sum = _accumulator_to_int(getattr(state, "_flops_cross_seqlen_product_sum", 0))
+    local_model_specific_stats = {
+        name: _accumulator_to_int(getattr(state, _model_specific_flops_attr(name), 0))
+        for name in model_specific_stat_names
+    }
     _ = vp_size
 
     use_all_reduce = (
@@ -210,6 +221,7 @@ def resolve_global_flops_runtime_stats(
             )
         if include_cross_attention_stats:
             stats_values.extend([local_cross_seqlen_sum, local_cross_seqlen_product_sum])
+        stats_values.extend(local_model_specific_stats[name] for name in model_specific_stat_names)
         stats = torch.tensor(stats_values, dtype=torch.long, device=device)
         torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM, group=dp_group)
         reduced_stats = [int(x) for x in stats.tolist()]
@@ -224,9 +236,11 @@ def resolve_global_flops_runtime_stats(
             vision_merged_token_sum = 0
         if include_cross_attention_stats:
             cross_seqlen_sum, cross_seqlen_product_sum = reduced_stats[offset : offset + 2]
+            offset += 2
         else:
             cross_seqlen_sum = 0
             cross_seqlen_product_sum = 0
+        model_specific_stats = dict(zip(model_specific_stat_names, reduced_stats[offset:], strict=True))
     else:
         # No process group: extrapolate from the local rank (approximation).
         seqlen_sum = local_seqlen_sum * data_parallel_size
@@ -237,6 +251,7 @@ def resolve_global_flops_runtime_stats(
         vision_merged_token_sum = local_vision_merged_token_sum * data_parallel_size
         cross_seqlen_sum = local_cross_seqlen_sum * data_parallel_size
         cross_seqlen_product_sum = local_cross_seqlen_product_sum * data_parallel_size
+        model_specific_stats = {name: value * data_parallel_size for name, value in local_model_specific_stats.items()}
 
     if seqlen_sum <= 0:
         seqlen_sum = None
@@ -253,6 +268,7 @@ def resolve_global_flops_runtime_stats(
         vision_merged_token_sum=max(vision_merged_token_sum, 0),
         cross_seqlen_sum=cross_seqlen_sum,
         cross_seqlen_product_sum=cross_seqlen_product_sum,
+        model_specific_stats={name: max(value, 0) for name, value in model_specific_stats.items()},
     )
 
 
@@ -284,6 +300,31 @@ def _add_flops_accumulator(state, name: str, delta) -> None:
     if not isinstance(current, (int, torch.Tensor)):
         current = 0
     setattr(state, name, current + delta)
+
+
+def _model_specific_flops_attr(name: str) -> str:
+    """Return the state attribute used for one custom additive FLOPs statistic."""
+    if not name.isidentifier() or name.startswith("_"):
+        raise ValueError(f"invalid model-specific FLOPs statistic name: {name!r}")
+    return f"_flops_model_specific_{name}"
+
+
+def reset_flops_metadata(state, *, model_specific_stat_names: tuple[str, ...] = ()) -> None:
+    """Reset all per-step FLOPs accumulators before forward microbatches run."""
+    for name in (
+        "_flops_seqlen_sum",
+        "_flops_seqlen_sq_sum",
+        "_flops_vision_patches",
+        "_flops_vision_patch_sum",
+        "_flops_vision_patch_sq_sum",
+        "_flops_vision_merged_token_sum",
+        "_flops_cross_seqlen_sum",
+        "_flops_cross_seqlen_product_sum",
+    ):
+        setattr(state, name, 0)
+    for name in model_specific_stat_names:
+        setattr(state, _model_specific_flops_attr(name), 0)
+    state._flops_requires_global_reduce = False
 
 
 def _scalar_sum_for_accumulator(value: torch.Tensor) -> int | torch.Tensor:
@@ -340,6 +381,7 @@ def accumulate_flops_metadata(
     *,
     vp_stage: int | None = None,
     config_seq_len: int | None = None,
+    total_sequence_tokens: int | None = None,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_argmin: torch.Tensor | None = None,
     cu_seqlens_unpadded: torch.Tensor | None = None,
@@ -348,6 +390,7 @@ def accumulate_flops_metadata(
     cross_cu_seqlens_unpadded: torch.Tensor | None = None,
     num_vision_patches: int | torch.Tensor | None = None,
     vision_patch_stats: tuple[int | torch.Tensor, int | torch.Tensor, int | torch.Tensor] | None = None,
+    model_specific_stats: Mapping[str, int | torch.Tensor] | None = None,
 ) -> None:
     """Accumulate per-microbatch FLOPS metadata onto ``state``.
 
@@ -361,6 +404,8 @@ def accumulate_flops_metadata(
     - ``_flops_seqlen_sum``: ``mbs * tokens.shape[1]`` (padded total tokens
       this microbatch contributes), or ``mbs * config_seq_len`` for dense
       non-packed batches whose tensors were already context-parallel sliced.
+      ``total_sequence_tokens`` explicitly supplies the global physical token
+      count for packed context-parallel models.
       Drives the linear MLP/proj/logit terms.
     - ``_flops_seqlen_sq_sum``: the THD attention term Σᵢ sᵢ², computed inline from
       ``cu_seqlens`` (preferring ``cu_seqlens_unpadded``). The per-pack sub-sequence
@@ -388,6 +433,10 @@ def accumulate_flops_metadata(
     conditional DP collective: if one rank supplies it, every rank in that pure
     DP group must supply a tuple, using ``(0, 0, 0)`` on ranks with no media.
 
+    ``model_specific_stats`` extends the same additive reduction contract for a
+    custom model estimator without teaching this utility model-specific field
+    names. Every DP rank must provide the same key set.
+
     For THD packed training (offline packed LLM SFT or VLM in-batch packing),
     treating the whole pack as one length-``seq_len`` sequence over-counts
     attention FLOPS by a large factor: actual attention work is Σᵢ sᵢ²,
@@ -398,6 +447,9 @@ def accumulate_flops_metadata(
 
     mbs = tokens.shape[0]
     tensor_seq_len = tokens.shape[1]
+    if total_sequence_tokens is not None and total_sequence_tokens <= 0:
+        raise ValueError("total_sequence_tokens must be positive")
+    linear_seq_len = total_sequence_tokens or tensor_seq_len
     dense_seq_len = config_seq_len if isinstance(config_seq_len, int) and config_seq_len > 0 else tensor_seq_len
 
     # THD attention term Σᵢ sᵢ², computed inline from cu_seqlens. The squared
@@ -408,7 +460,7 @@ def accumulate_flops_metadata(
     # (which would force a data-dependent-size sync) is needed.
     sub_seq_lens = _real_subseq_lengths(cu_seqlens, cu_seqlens_argmin, cu_seqlens_unpadded, cu_seqlens_unpadded_argmin)
     if sub_seq_lens is not None and sub_seq_lens.numel() > 0:
-        _add_flops_accumulator(state, "_flops_seqlen_sum", mbs * tensor_seq_len)
+        _add_flops_accumulator(state, "_flops_seqlen_sum", mbs * linear_seq_len)
         setattr(state, "_flops_requires_global_reduce", True)
         _add_flops_accumulator(state, "_flops_seqlen_sq_sum", _scalar_sum_for_accumulator(sub_seq_lens.long() ** 2))
     else:
@@ -457,6 +509,11 @@ def accumulate_flops_metadata(
             _add_flops_accumulator(state, name, value)
         # Image/video grids and resolutions may differ across DP ranks even for
         # dense text batches, so exact grid statistics require a global SUM.
+        setattr(state, "_flops_requires_global_reduce", True)
+
+    if model_specific_stats is not None:
+        for name, value in model_specific_stats.items():
+            _add_flops_accumulator(state, _model_specific_flops_attr(name), value)
         setattr(state, "_flops_requires_global_reduce", True)
 
 
@@ -635,6 +692,7 @@ def num_floating_point_operations(
     num_vision_patches: int = 0,
     cross_seqlen_sum: int | None = None,
     cross_seqlen_product_sum: int | None = None,
+    model_specific_stats: Mapping[str, int] | None = None,
 ):
     """Return the number of floating point operations.
 
@@ -654,17 +712,24 @@ def num_floating_point_operations(
             (before spatial merge). Used to compute ViT encoder FLOPS.
         cross_seqlen_sum: Sum of cross-attention key/value sequence lengths.
         cross_seqlen_product_sum: Sum of per-sample query and key/value length products.
+        model_specific_stats: Additive runtime values consumed by a custom
+            model estimator.
     """
     peft = getattr(cfg, "peft", None)
     is_lora = isinstance(peft, LoRA)
     runtime_flops_estimator = getattr(cfg.model, "_get_num_floating_point_operations_with_runtime_stats", None)
     if runtime_flops_estimator is not None and not is_lora:
+        runtime_kwargs = {
+            "batch_size": batch_size,
+            "seqlen_sum": seqlen_sum,
+            "seqlen_squared_sum": seqlen_squared_sum,
+            "cross_seqlen_sum": cross_seqlen_sum,
+            "cross_seqlen_product_sum": cross_seqlen_product_sum,
+        }
+        if model_specific_stats:
+            runtime_kwargs["model_specific_stats"] = model_specific_stats
         return runtime_flops_estimator(
-            batch_size=batch_size,
-            seqlen_sum=seqlen_sum,
-            seqlen_squared_sum=seqlen_squared_sum,
-            cross_seqlen_sum=cross_seqlen_sum,
-            cross_seqlen_product_sum=cross_seqlen_product_sum,
+            **runtime_kwargs,
         )
 
     # Compute effective sequence length from actual values or fall back to config.

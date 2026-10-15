@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from megatron.core.models.magi2 import (
     Magi2Config,
@@ -30,6 +31,12 @@ from megatron.core.models.magi2 import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from megatron.bridge.models.model_provider import ModelProviderMixin
+
+from .flops import (
+    MAGI2_FLOPS_RUNTIME_STAT_NAMES,
+    Magi2FlopEstimate,
+    estimate_magi2_training_flops,
+)
 
 
 _ORIGINAL_ARCHITECTURE_FIELDS = (
@@ -96,6 +103,7 @@ class Magi2ModelProvider(Magi2Config, ModelProviderMixin[Magi2Model]):
         default_magi2_layer_specs
     )
     _pg_collection: ProcessGroupCollection | None = field(default=None, init=False, repr=False, compare=False)
+    _flops_runtime_stat_names: ClassVar[tuple[str, ...]] = MAGI2_FLOPS_RUNTIME_STAT_NAMES
 
     def __post_init__(self) -> None:
         """Defer MCore validation until Bridge has applied recipe overrides."""
@@ -134,6 +142,41 @@ class Magi2ModelProvider(Magi2Config, ModelProviderMixin[Magi2Model]):
             post_process=True if post_process is None else post_process,
             vp_stage=vp_stage,
         )
+
+    def get_magi2_flop_estimate(
+        self,
+        *,
+        seqlen_sum: int,
+        seqlen_squared_sum: int,
+        model_specific_stats: Mapping[str, int],
+    ) -> Magi2FlopEstimate:
+        """Return component-level FLOPs for one runtime MAGI-2 global batch."""
+        return estimate_magi2_training_flops(
+            self,
+            seqlen_sum=seqlen_sum,
+            seqlen_squared_sum=seqlen_squared_sum,
+            modality_token_counts=model_specific_stats,
+        )
+
+    def _get_num_floating_point_operations_with_runtime_stats(
+        self,
+        *,
+        batch_size: int,
+        seqlen_sum: int | None,
+        seqlen_squared_sum: int | None,
+        cross_seqlen_sum: int | None,
+        cross_seqlen_product_sum: int | None,
+        model_specific_stats: Mapping[str, int],
+    ) -> int:
+        """Return conventional MAGI-2 model FLOPs for Bridge throughput logs."""
+        del batch_size, cross_seqlen_sum, cross_seqlen_product_sum
+        if seqlen_sum is None or seqlen_squared_sum is None:
+            raise ValueError("MAGI-2 FLOP accounting requires runtime packed-sequence statistics")
+        return self.get_magi2_flop_estimate(
+            seqlen_sum=seqlen_sum,
+            seqlen_squared_sum=seqlen_squared_sum,
+            model_specific_stats=model_specific_stats,
+        ).algorithmic_training
 
 
 __all__ = ["Magi2ModelProvider", "default_magi2_layer_specs"]

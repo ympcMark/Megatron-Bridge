@@ -23,6 +23,7 @@ from megatron.bridge.diffusion.models.magi2.data import (
     write_magi2_latent_dataset,
     write_magi2_precomputed_latent_dataset,
 )
+from megatron.bridge.diffusion.models.magi2.flops import Magi2FlopEstimate, estimate_magi2_training_flops
 from megatron.bridge.diffusion.models.magi2.magi2_step import Magi2ForwardStep
 from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 
@@ -30,10 +31,12 @@ from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 __all__ = [
     "Magi2ForwardStep",
     "Magi2DiskLatentDataset",
+    "Magi2FlopEstimate",
     "Magi2LatentDataset",
     "Magi2LatentDatasetConfig",
     "Magi2ModelProvider",
     "generate_magi2_latent_sample",
+    "estimate_magi2_training_flops",
     "magi2_latent_collate",
     "write_magi2_latent_dataset",
     "write_magi2_precomputed_latent_dataset",

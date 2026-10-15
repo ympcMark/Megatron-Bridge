@@ -108,6 +108,13 @@ def _unwrap_modules(model: torch.nn.Module):
     yield from model.modules()
 
 
+def _step_start_callback(context: CallbackContext) -> None:
+    """Start a synchronized wall-clock interval for one optimizer step."""
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    context.user_state["magi2_step_start_time"] = time.perf_counter()
+
+
 def _load_official_checkpoint(
     checkpoint_dir: Path,
     model_chunks: list[Magi2Model],
@@ -132,13 +139,16 @@ def _step_callback(
     tokens_per_sample: int,
     context: CallbackContext,
 ) -> None:
+    torch.cuda.synchronize()
+    step_end = time.perf_counter()
+    step_start = context.user_state.pop("magi2_step_start_time", None)
+    if not isinstance(step_start, float):
+        raise RuntimeError("MAGI-2 step timing callback did not observe the step start")
+    step_time = step_end - step_start
     for model_chunk in context.model:
         for module in _unwrap_modules(model_chunk):
             if isinstance(module, Magi2MultiHeadTopKRouter):
                 module.update_expert_bias_ema(router_bias_ema)
-    now = time.perf_counter()
-    step_time = now - context.user_state["magi2_last_step_time"]
-    context.user_state["magi2_last_step_time"] = now
     rank_stats = torch.tensor(
         [
             torch.cuda.max_memory_allocated(),
@@ -154,10 +164,32 @@ def _step_callback(
     torch.distributed.all_reduce(stats_sum, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(stats_min, op=torch.distributed.ReduceOp.MIN)
     torch.distributed.all_reduce(stats_max, op=torch.distributed.ReduceOp.MAX)
-    torch.cuda.reset_peak_memory_stats()
     if torch.distributed.get_rank() != 0:
         return
     world_size = torch.distributed.get_world_size()
+    algorithmic_flops = int(getattr(context.state, "_flops_in_last_batch", 0))
+    runtime_stats = getattr(context.state, "_flops_runtime_stats", None)
+    executed_flops = None
+    if (
+        runtime_stats is not None
+        and runtime_stats.seqlen_sum is not None
+        and runtime_stats.seqlen_squared_sum is not None
+    ):
+        flop_estimate = context.state.cfg.model.get_magi2_flop_estimate(
+            seqlen_sum=runtime_stats.seqlen_sum,
+            seqlen_squared_sum=runtime_stats.seqlen_squared_sum,
+            model_specific_stats=runtime_stats.model_specific_stats,
+        )
+        executed_flops = flop_estimate.executed_training
+    max_step_time = stats_max[2].item()
+    if runtime_stats is None:
+        global_logical_tokens = global_batch_size * tokens_per_sample
+        global_physical_tokens = global_logical_tokens
+    else:
+        global_physical_tokens = runtime_stats.seqlen_sum or 0
+        global_logical_tokens = global_physical_tokens - runtime_stats.model_specific_stats.get(
+            "magi2_padding_tokens", 0
+        )
     learning_rate = get_canonical_lr_for_logging(context.optimizer.param_groups)
     losses = {name: value.detach().float().cpu().tolist() for name, value in sorted((context.loss_dict or {}).items())}
     row = {
@@ -175,8 +207,16 @@ def _step_callback(
             "mean": stats_sum[2].item() / world_size,
             "max": stats_max[2].item(),
         },
-        "global_samples_per_second": global_batch_size / stats_max[2].item(),
-        "global_tokens_per_second": global_batch_size * tokens_per_sample / stats_max[2].item(),
+        "global_samples_per_second": global_batch_size / max_step_time,
+        "global_logical_tokens": global_logical_tokens,
+        "global_physical_tokens": global_physical_tokens,
+        "global_tokens_per_second": global_logical_tokens / max_step_time,
+        "algorithmic_flops": algorithmic_flops,
+        "model_tflops_per_gpu": algorithmic_flops / max_step_time / world_size / 1e12,
+        "executed_flops_including_recompute": executed_flops,
+        "executed_model_tflops_per_gpu": (
+            None if executed_flops is None else executed_flops / max_step_time / world_size / 1e12
+        ),
         "memory_allocated_gib": {
             "min": stats_min[0].item() / 1024**3,
             "mean": stats_sum[0].item() / world_size / 1024**3,
@@ -411,6 +451,10 @@ def main() -> None:
                 "official_checkpoint": (
                     None if args.official_checkpoint is None else str(args.official_checkpoint.resolve())
                 ),
+                "flops_definition": (
+                    "matmul model FLOPs; multiply-add=2; algorithmic training=3x forward; "
+                    "executed training additionally includes full activation recompute"
+                ),
             },
             "data": {
                 "kind": (
@@ -437,10 +481,7 @@ def main() -> None:
             raise ValueError(f"run manifest already exists: {manifest_path}")
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     callbacks = CallbackManager()
-    callbacks.register(
-        "on_train_start",
-        lambda context: context.user_state.update({"magi2_last_step_time": time.perf_counter()}),
-    )
+    callbacks.register("on_train_step_start", _step_start_callback)
     callbacks.register(
         "on_train_step_end",
         lambda context: _step_callback(

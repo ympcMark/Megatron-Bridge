@@ -39,8 +39,17 @@ def main() -> None:
     losses = [float(row["losses"]["flow_mse"]) for row in rows]
     grad_norms = [float(row["grad_norm"]) for row in rows]
     throughputs = [float(row["global_tokens_per_second"]) for row in rows]
-    measured_throughputs = throughputs[min(args.warmup_steps, len(rows) - 1) :]
-    values = losses + grad_norms + throughputs
+    step_times = [float(row["step_time_seconds"]["max"]) for row in rows]
+    model_tflops = [float(row["model_tflops_per_gpu"]) for row in rows]
+    executed_model_tflops = [row["executed_model_tflops_per_gpu"] for row in rows]
+    measured_start = min(args.warmup_steps, len(rows) - 1)
+    measured_throughputs = throughputs[measured_start:]
+    measured_step_times = step_times[measured_start:]
+    measured_model_tflops = model_tflops[measured_start:]
+    measured_executed_model_tflops = [
+        float(value) for value in executed_model_tflops[measured_start:] if value is not None
+    ]
+    values = losses + grad_norms + throughputs + step_times + model_tflops + measured_executed_model_tflops
     if not all(math.isfinite(value) for value in values):
         raise ValueError("non-finite scalar detected")
 
@@ -59,6 +68,24 @@ def main() -> None:
             "mean": statistics.fmean(measured_throughputs),
             "median": statistics.median(measured_throughputs),
         },
+        "step_time_seconds_after_warmup": {
+            "min": min(measured_step_times),
+            "mean": statistics.fmean(measured_step_times),
+            "median": statistics.median(measured_step_times),
+            "max": max(measured_step_times),
+        },
+        "model_tflops_per_gpu_after_warmup": {
+            "mean": statistics.fmean(measured_model_tflops),
+            "median": statistics.median(measured_model_tflops),
+        },
+        "executed_model_tflops_per_gpu_after_warmup": (
+            None
+            if not measured_executed_model_tflops
+            else {
+                "mean": statistics.fmean(measured_executed_model_tflops),
+                "median": statistics.median(measured_executed_model_tflops),
+            }
+        ),
         "peak_memory_allocated_gib": max(float(row["memory_allocated_gib"]["max"]) for row in rows),
         "peak_memory_reserved_gib": max(float(row["memory_reserved_gib"]["max"]) for row in rows),
         "skipped_iterations": 0,

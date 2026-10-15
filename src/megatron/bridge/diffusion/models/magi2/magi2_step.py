@@ -25,8 +25,11 @@ from megatron.core.models.magi2 import Magi2Modality, Magi2Model
 from torch import Tensor
 
 from megatron.bridge.training.state import GlobalState
+from megatron.bridge.training.utils.flop_utils import accumulate_flops_metadata, get_model_chunk_vp_stage
 from megatron.bridge.training.utils.packed_seq_utils import get_thd_cp_partition_indices
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
+
+from .flops import MAGI2_FLOPS_RUNTIME_STAT_NAMES
 
 
 def magi2_timestep_embedding(timestep: Tensor, width: int) -> Tensor:
@@ -286,6 +289,8 @@ class Magi2ForwardStep:
         else:
             raise ValueError("clean_inputs must have shape [tokens, channels] or [batch, tokens, channels]")
 
+        global_modality_mapping = flattened_mapping
+
         cp_group = get_pg_collection(model).cp
         token_sigmas, noise = magi2_deterministic_packed_flow_random(
             flattened_clean,
@@ -328,6 +333,26 @@ class Magi2ForwardStep:
             flattened_coordinates = token_tensors["coordinates"]
             flattened_mapping = token_tensors["modality_mapping"]
             time_token_sequence = token_tensors["time_token_sequence"]
+
+        physical_token_count = model_inputs.shape[0] * cp_group.size()
+        padding_tokens = physical_token_count - global_modality_mapping.numel()
+        modality_token_counts = {
+            "magi2_video_tokens": (global_modality_mapping == Magi2Modality.VIDEO).sum(),
+            "magi2_audio_tokens": (global_modality_mapping == Magi2Modality.AUDIO).sum(),
+            "magi2_text_tokens": (global_modality_mapping == Magi2Modality.TEXT).sum(),
+            "magi2_padding_tokens": padding_tokens,
+        }
+        if tuple(modality_token_counts) != MAGI2_FLOPS_RUNTIME_STAT_NAMES:
+            raise RuntimeError("MAGI-2 FLOP runtime statistic names are inconsistent")
+        accumulate_flops_metadata(
+            state,
+            flattened_clean.unsqueeze(0),
+            vp_stage=get_model_chunk_vp_stage(model),
+            total_sequence_tokens=physical_token_count,
+            cu_seqlens=cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens,
+            cu_seqlens_unpadded=cu_seqlens if cu_seqlens_padded is not None else None,
+            model_specific_stats=modality_token_counts,
+        )
 
         output = model(
             model_inputs,

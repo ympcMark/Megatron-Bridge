@@ -14,6 +14,7 @@
 
 import json
 import math
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import examples.models.magi2.pretrain_magi2 as pretrain_module
@@ -39,6 +40,7 @@ from megatron.bridge.diffusion.models.magi2.data import (
     write_magi2_latent_dataset,
     write_magi2_precomputed_latent_dataset,
 )
+from megatron.bridge.diffusion.models.magi2.flops import MAGI2_FLOPS_RUNTIME_STAT_NAMES
 from megatron.bridge.diffusion.models.magi2.magi2_step import (
     magi2_deterministic_flow_random,
     magi2_deterministic_packed_flow_random,
@@ -55,6 +57,12 @@ from megatron.bridge.diffusion.models.magi2.provider import Magi2ModelProvider
 from megatron.bridge.recipes.magi2.h100.magi2 import (
     magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config,
     magi2_114b_pretrain_64gpu_h100_bf16_fsdp_cp2_config,
+)
+from megatron.bridge.training.utils.flop_utils import (
+    accumulate_flops_metadata,
+    num_floating_point_operations,
+    reset_flops_metadata,
+    resolve_global_flops_runtime_stats,
 )
 from megatron.bridge.training.utils.theoretical_memory_utils import estimate_training_memory
 
@@ -99,6 +107,135 @@ def test_original_fsdp_recipe_uses_fully_sharded_dtensor_contract():
     assert routed_component.parameter_count == 108_716_359_680
     assert routed_component.parameter_count_per_gpu == 1_698_693_120
     assert estimate.total_parameters == 113_934_732_336
+
+
+def test_original_recipe_reports_runtime_aware_algorithmic_and_recompute_flops():
+    cfg = magi2_114b_pretrain_64gpu_h100_bf16_fsdp_config()
+    modality_counts = {
+        "magi2_video_tokens": 64 * 2000,
+        "magi2_audio_tokens": 64 * 14,
+        "magi2_text_tokens": 64 * 13,
+        "magi2_padding_tokens": 0,
+    }
+
+    estimate = cfg.model.get_magi2_flop_estimate(
+        seqlen_sum=64 * 2027,
+        seqlen_squared_sum=64 * 2027**2,
+        model_specific_stats=modality_counts,
+    )
+
+    assert estimate.adapters_forward == 409_498_288_128
+    assert estimate.attention_forward == 521_780_047_380_480
+    assert estimate.mhc_forward == 7_396_613_160_960
+    assert estimate.dense_mlp_forward == 78_353_088_380_928
+    assert estimate.moe_router_forward == 7_345_602_035_712
+    assert estimate.moe_routed_forward == 661_104_183_214_080
+    assert estimate.moe_shared_forward == 220_368_061_071_360
+    assert estimate.moe_split_merge_forward == 176_294_448_857_088
+    assert estimate.algorithmic_training == 5_019_154_627_166_208
+    assert estimate.executed_training == 6_691_796_671_266_816
+    assert (
+        num_floating_point_operations(
+            cfg,
+            batch_size=64,
+            seqlen_sum=64 * 2027,
+            seqlen_squared_sum=64 * 2027**2,
+            model_specific_stats=modality_counts,
+        )
+        == estimate.algorithmic_training
+    )
+
+
+def test_model_specific_flops_metadata_accumulates_and_scales_over_data_parallelism():
+    state = SimpleNamespace()
+    reset_flops_metadata(state, model_specific_stat_names=MAGI2_FLOPS_RUNTIME_STAT_NAMES)
+    accumulate_flops_metadata(
+        state,
+        torch.zeros(1, 5),
+        total_sequence_tokens=8,
+        cu_seqlens=torch.tensor([0, 4, 8], dtype=torch.int32),
+        cu_seqlens_unpadded=torch.tensor([0, 2, 5], dtype=torch.int32),
+        model_specific_stats={
+            "magi2_video_tokens": torch.tensor(2),
+            "magi2_audio_tokens": torch.tensor(2),
+            "magi2_text_tokens": torch.tensor(1),
+            "magi2_padding_tokens": torch.tensor(3),
+        },
+    )
+
+    stats = resolve_global_flops_runtime_stats(
+        state,
+        data_parallel_size=2,
+        model_specific_stat_names=MAGI2_FLOPS_RUNTIME_STAT_NAMES,
+    )
+
+    assert stats.seqlen_sum == 16
+    assert stats.seqlen_squared_sum == 2 * (2**2 + 3**2)
+    assert stats.model_specific_stats == {
+        "magi2_video_tokens": 4,
+        "magi2_audio_tokens": 4,
+        "magi2_text_tokens": 2,
+        "magi2_padding_tokens": 6,
+    }
+
+
+def test_training_callbacks_report_synchronized_step_time_and_flops(tmp_path, monkeypatch):
+    output = tmp_path / "metrics.jsonl"
+    model_config = Magi2ModelProvider()
+    runtime_stats = SimpleNamespace(
+        seqlen_sum=5,
+        seqlen_squared_sum=25,
+        model_specific_stats={
+            "magi2_video_tokens": 2,
+            "magi2_audio_tokens": 2,
+            "magi2_text_tokens": 1,
+            "magi2_padding_tokens": 0,
+        },
+    )
+    algorithmic_flops = model_config.get_magi2_flop_estimate(
+        seqlen_sum=runtime_stats.seqlen_sum,
+        seqlen_squared_sum=runtime_stats.seqlen_squared_sum,
+        model_specific_stats=runtime_stats.model_specific_stats,
+    ).algorithmic_training
+    context = SimpleNamespace(
+        state=SimpleNamespace(
+            cfg=SimpleNamespace(model=model_config),
+            train_state=SimpleNamespace(step=0),
+            _flops_in_last_batch=algorithmic_flops,
+            _flops_runtime_stats=runtime_stats,
+        ),
+        model=[SimpleNamespace(modules=lambda: ())],
+        user_state={},
+        optimizer=SimpleNamespace(param_groups=[]),
+        loss_dict={"flow_mse": torch.tensor([1.0, 2.0])},
+        grad_norm=3.0,
+        skipped_iter=False,
+    )
+    synchronize = Mock()
+    reset_peak_memory = Mock()
+    clock = iter((10.0, 20.0))
+    monkeypatch.setattr(pretrain_module.torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(pretrain_module.torch.cuda, "reset_peak_memory_stats", reset_peak_memory)
+    monkeypatch.setattr(pretrain_module.torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(pretrain_module.torch.cuda, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(pretrain_module.torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(pretrain_module.torch.distributed, "all_reduce", lambda tensor, op: None)
+    monkeypatch.setattr(pretrain_module.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_module.torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(pretrain_module.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(pretrain_module, "get_canonical_lr_for_logging", lambda groups: 1e-4)
+
+    pretrain_module._step_start_callback(context)
+    pretrain_module._step_callback(output, 0.999, 1, 5, context)
+
+    row = json.loads(output.read_text())
+    assert row["step_time_seconds"] == {"min": 10.0, "mean": 10.0, "max": 10.0}
+    assert row["algorithmic_flops"] == algorithmic_flops
+    assert row["model_tflops_per_gpu"] == algorithmic_flops / 10.0 / 1e12
+    assert row["executed_flops_including_recompute"] == algorithmic_flops
+    assert row["global_tokens_per_second"] == 0.5
+    assert synchronize.call_count == 2
+    reset_peak_memory.assert_called_once_with()
 
 
 def test_original_fsdp_cp2_recipe_uses_per_element_global_normalization():

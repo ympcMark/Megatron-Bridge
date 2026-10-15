@@ -339,6 +339,7 @@ def train(
     p2p_communicator = P2PCommunicator(pp_group=pg_collection.pp, config=model_config)
     data_distribution_group = get_data_distribution_group(pg_collection, config.model)
     dp_size = data_distribution_group.size()
+    model_specific_flops_stat_names = tuple(getattr(config.model, "_flops_runtime_stat_names", ()))
     # Anchor for interval-average throughput logging: training_log reports the FLOPS
     # performed over each logging interval as the delta of
     # floating_point_operations_so_far. Seed it with the current cumulative (0 fresh,
@@ -479,15 +480,10 @@ def train(
             )
 
         # Reset per-step FLOPS accumulators (filled by forward_step micro-batches).
-        global_state._flops_seqlen_sum = 0
-        global_state._flops_seqlen_sq_sum = 0
-        global_state._flops_vision_patches = 0
-        global_state._flops_vision_patch_sum = 0
-        global_state._flops_vision_patch_sq_sum = 0
-        global_state._flops_vision_merged_token_sum = 0
-        global_state._flops_cross_seqlen_sum = 0
-        global_state._flops_cross_seqlen_product_sum = 0
-        global_state._flops_requires_global_reduce = False
+        flop_utils.reset_flops_metadata(
+            global_state,
+            model_specific_stat_names=model_specific_flops_stat_names,
+        )
 
         (
             loss_dict,
@@ -511,6 +507,43 @@ def train(
         )
 
         fault_tolerance.on_training_step_end(global_state)
+
+        # Resolve runtime shape metadata before callbacks so per-step reporters
+        # can consume the same exact FLOPs value as the standard training log.
+        batch_size = dp_size * train_config.micro_batch_size * get_num_microbatches()
+        flops_stats = flop_utils.resolve_global_flops_runtime_stats(
+            global_state,
+            data_parallel_size=dp_size,
+            vp_size=config.model.virtual_pipeline_model_parallel_size,
+            dp_group=data_distribution_group,
+            include_vision_patch_stats=True,
+            include_cross_attention_stats=hasattr(
+                config.model, "_get_num_floating_point_operations_with_runtime_stats"
+            ),
+            model_specific_stat_names=model_specific_flops_stat_names,
+        )
+        num_floating_point_operations_in_batch = flop_utils.num_floating_point_operations(
+            config,
+            batch_size=batch_size,
+            seqlen_sum=flops_stats.seqlen_sum,
+            seqlen_squared_sum=flops_stats.seqlen_squared_sum,
+            num_vision_patches=0 if flops_stats.has_exact_vision_stats else flops_stats.num_vision_patches,
+            cross_seqlen_sum=flops_stats.cross_seqlen_sum,
+            cross_seqlen_product_sum=flops_stats.cross_seqlen_product_sum,
+            model_specific_stats=flops_stats.model_specific_stats,
+        )
+        if flops_stats.has_exact_vision_stats:
+            num_floating_point_operations_in_batch += flop_utils.vit_flops_from_patch_stats(
+                config,
+                patch_sum=flops_stats.vision_patch_sum,
+                patch_squared_sum=flops_stats.vision_patch_squared_sum,
+                merged_token_sum=flops_stats.vision_merged_token_sum,
+            )
+        global_state._flops_in_last_batch = num_floating_point_operations_in_batch
+        global_state._flops_runtime_stats = flops_stats
+        global_state.train_state.floating_point_operations_so_far += num_floating_point_operations_in_batch
+        num_floating_point_operations_so_far = global_state.train_state.floating_point_operations_so_far
+        num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
         if should_fire(callback_manager, "on_train_step_end"):
             callback_manager.fire(
@@ -586,7 +619,6 @@ def train(
         if global_state.train_state.step == start_iteration + 1 and config.ddp.use_megatron_fsdp:
             _maybe_register_fsdp_buffers(config, model)
 
-        batch_size = dp_size * train_config.micro_batch_size * get_num_microbatches()
         global_state.train_state.consumed_train_samples += batch_size
         num_skipped_samples_in_batch = get_current_global_batch_size() - get_current_running_global_batch_size()
         if train_config.decrease_batch_size_if_needed:
@@ -594,41 +626,6 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         global_state.train_state.skipped_train_samples += num_skipped_samples_in_batch
-
-        # Resolve this step's data-parallel-global FLOPS sequence stats and fold the
-        # step's FLOPS into the running total. Dense BSHD batches extrapolate exact
-        # fixed-length stats from the local DP rank; THD batches request one exact SUM
-        # all-reduce over the pure DP group because packed sub-sequence lengths can
-        # differ by rank.
-        flops_stats = flop_utils.resolve_global_flops_runtime_stats(
-            global_state,
-            data_parallel_size=dp_size,
-            vp_size=config.model.virtual_pipeline_model_parallel_size,
-            dp_group=data_distribution_group,
-            include_vision_patch_stats=True,
-            include_cross_attention_stats=hasattr(
-                config.model, "_get_num_floating_point_operations_with_runtime_stats"
-            ),
-        )
-        num_floating_point_operations_in_batch = flop_utils.num_floating_point_operations(
-            config,
-            batch_size=batch_size,
-            seqlen_sum=flops_stats.seqlen_sum,
-            seqlen_squared_sum=flops_stats.seqlen_squared_sum,
-            num_vision_patches=0 if flops_stats.has_exact_vision_stats else flops_stats.num_vision_patches,
-            cross_seqlen_sum=flops_stats.cross_seqlen_sum,
-            cross_seqlen_product_sum=flops_stats.cross_seqlen_product_sum,
-        )
-        if flops_stats.has_exact_vision_stats:
-            num_floating_point_operations_in_batch += flop_utils.vit_flops_from_patch_stats(
-                config,
-                patch_sum=flops_stats.vision_patch_sum,
-                patch_squared_sum=flops_stats.vision_patch_squared_sum,
-                merged_token_sum=flops_stats.vision_merged_token_sum,
-            )
-        global_state.train_state.floating_point_operations_so_far += num_floating_point_operations_in_batch
-        num_floating_point_operations_so_far = global_state.train_state.floating_point_operations_so_far
-        num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
         # Logging.
         if not config.logger.skip_train_metrics_log:

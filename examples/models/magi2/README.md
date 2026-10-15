@@ -37,7 +37,12 @@ sbatch examples/models/magi2/pretrain_magi2_114b_64gpu.slurm
 
 Each run writes a JSON manifest plus one JSONL row per optimizer step. Rows record
 finite-loss and finite-gradient checks, skipped iterations, cross-rank peak
-memory, and throughput.
+memory, synchronized optimizer-step time, throughput, algorithmic model FLOPs,
+and model TFLOP/s/GPU. MAGI-2 FLOPs use the runtime packed lengths and modality
+token counts; the report also includes executed FLOPs for full activation
+recomputation. The conventional model-FLOPs value counts matrix multiplications
+with one multiply-add equal to two FLOPs and approximates backward as twice the
+forward work. Elementwise operations and communication are not counted.
 
 To run the full model with EP64, CP2, and fully sharded parameters, gradients,
 and optimizer state, add:
