@@ -74,13 +74,40 @@ def _block_mask(nested_masks: list[torch.Tensor], num_heads: int) -> Any:
     )
 
 
+def _partition_indexes(
+    indexes: torch.Tensor,
+    rank: int,
+    world_size: int,
+    alignment: int = 1,
+) -> tuple[torch.Tensor, int, slice]:
+    """Return one fixed-width CP slice and its unpadded source range."""
+    if not 0 <= rank < world_size:
+        raise ValueError(f"Invalid CP rank/size: {rank}/{world_size}")
+    padded_length = (len(indexes) + world_size - 1) // world_size
+    padded_length = (padded_length + alignment - 1) // alignment * alignment
+    start = rank * padded_length
+    source_slice = slice(start, min(start + padded_length, len(indexes)))
+    return indexes[source_slice], padded_length, source_slice
+
+
+def _pad_first_dim(tensor: torch.Tensor, length: int) -> torch.Tensor:
+    """Pad a CP-local tensor to the collective's fixed sequence length."""
+    if len(tensor) == length:
+        return tensor
+    padding = tensor.new_zeros((length - len(tensor), *tensor.shape[1:]))
+    return torch.cat((tensor, padding))
+
+
 def bagel_packed_batch_to_mimo(
     packed_batch: dict[str, object],
     scheduler: BagelDiffusionScheduler,
     *,
     num_attention_heads: int,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    sequence_parallel_size: int = 1,
 ) -> dict[str, object]:
-    """Create the CP=1 MIMO batch consumed by MCore BAGEL."""
+    """Create the CP-local MIMO batch consumed by MCore BAGEL."""
     from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 
     sequence_length = packed_batch["sequence_length"]
@@ -93,6 +120,10 @@ def bagel_packed_batch_to_mimo(
     else:
         und_indexes = text_indexes
     vae_indexes = packed_batch["packed_vae_token_indexes"].cuda(non_blocking=True)
+    local_und_indexes, padded_und_seqlen, _ = _partition_indexes(und_indexes, cp_rank, cp_size, sequence_parallel_size)
+    local_gen_indexes, padded_gen_seqlen, local_gen_slice = _partition_indexes(
+        vae_indexes, cp_rank, cp_size, sequence_parallel_size
+    )
 
     labels_full = torch.full((sequence_length,), -100, dtype=torch.long, device="cuda")
     loss_mask_full = torch.zeros(sequence_length, dtype=torch.float, device="cuda")
@@ -112,6 +143,14 @@ def bagel_packed_batch_to_mimo(
     )
     dense_target[gen_loss_mask.bool()] = target
     packed_positions = packed_batch["packed_position_ids"].cuda(non_blocking=True)
+    local_target = _pad_first_dim(dense_target[local_gen_slice], padded_gen_seqlen)
+    local_gen_loss_mask = _pad_first_dim(gen_loss_mask[local_gen_slice], padded_gen_seqlen)
+    local_positions = torch.cat(
+        (
+            _pad_first_dim(packed_positions[local_und_indexes], padded_und_seqlen),
+            _pad_first_dim(packed_positions[local_gen_indexes], padded_gen_seqlen),
+        )
+    )
 
     modality_inputs: dict[str, object] = {
         "diffusion": {
@@ -135,23 +174,23 @@ def bagel_packed_batch_to_mimo(
         packed_vae_token_indexes=vae_indexes,
         packed_und_token_indexes=und_indexes,
         packed_gen_token_indexes=vae_indexes,
-        local_und_token_indexes=und_indexes,
-        local_gen_token_indexes=vae_indexes,
-        padded_und_seqlen=len(und_indexes),
-        padded_gen_seqlen=len(vae_indexes),
+        local_und_token_indexes=local_und_indexes,
+        local_gen_token_indexes=local_gen_indexes,
+        padded_und_seqlen=padded_und_seqlen,
+        padded_gen_seqlen=padded_gen_seqlen,
         vit_tokens_encoded_per_cp=None,
     )
     return {
         "input_ids": text_ids.unsqueeze(0),
         "position_ids": torch.arange(len(text_ids), device="cuda").unsqueeze(0),
         "attention_mask": _block_mask(packed_batch["nested_attention_masks"], num_attention_heads),
-        "labels": labels_full[und_indexes],
-        "loss_mask": loss_mask_full[und_indexes],
+        "labels": labels_full[local_und_indexes],
+        "loss_mask": loss_mask_full[local_und_indexes],
         "modality_inputs": modality_inputs,
         "sample_lens": packed_batch["sample_lens"],
-        "packed_position_ids": torch.cat((packed_positions[und_indexes], packed_positions[vae_indexes])),
+        "packed_position_ids": local_positions,
         "sequence_length": sequence_length,
-        "vis_gen_target": dense_target,
-        "gen_loss_mask": gen_loss_mask,
+        "vis_gen_target": local_target,
+        "gen_loss_mask": local_gen_loss_mask,
         "packed_seq_params": packed_seq_params,
     }

@@ -24,10 +24,11 @@ from torch.utils.data._utils.worker import _generate_state
 from megatron.bridge.models.bagel.bagel_step import (
     _accumulate_bagel_flops_metadata,
     _initialize_scheduler,
+    _reference_training_rank_seed,
     _seed_reference_training_rng,
     bagel_loss,
 )
-from megatron.bridge.models.bagel.data.batch import _attention_metadata
+from megatron.bridge.models.bagel.data.batch import _attention_metadata, _pad_first_dim, _partition_indexes
 from megatron.bridge.models.bagel.data.external import BagelRNGIterator
 from megatron.bridge.models.bagel.diffusion import BagelDiffusionScheduler
 from megatron.bridge.models.bagel.provider import BagelModelProvider, _complete_mot_layer_sharded_state_dict
@@ -118,6 +119,38 @@ def test_attention_metadata_preserves_sample_boundaries():
     )
 
 
+def test_cp_partition_uses_fixed_width_and_preserves_global_order():
+    indexes = torch.tensor([2, 5, 7, 11, 13])
+    first, first_length, first_slice = _partition_indexes(indexes, 0, 2)
+    second, second_length, second_slice = _partition_indexes(indexes, 1, 2)
+
+    assert first_length == second_length == 3
+    assert first_slice == slice(0, 3)
+    assert second_slice == slice(3, 5)
+    assert torch.equal(torch.cat((first, second)), indexes)
+    assert torch.equal(_pad_first_dim(second, second_length), torch.tensor([11, 13, 0]))
+
+
+def test_cp1_partition_is_unchanged():
+    indexes = torch.tensor([3, 4, 8])
+    local, padded_length, source_slice = _partition_indexes(indexes, 0, 1)
+
+    assert padded_length == len(indexes)
+    assert source_slice == slice(0, len(indexes))
+    assert torch.equal(local, indexes)
+
+
+def test_cp_partition_aligns_branch_lengths_for_sequence_parallelism():
+    indexes = torch.tensor([2, 5, 7, 11, 13])
+    first, first_length, first_slice = _partition_indexes(indexes, 0, 2, 2)
+    second, second_length, second_slice = _partition_indexes(indexes, 1, 2, 2)
+
+    assert first_length == second_length == 4
+    assert first_slice == slice(0, 4)
+    assert second_slice == slice(4, 5)
+    assert torch.equal(torch.cat((first, second)), indexes)
+
+
 def test_mot_sharded_state_includes_unsharded_input_norms(monkeypatch):
     def sharded_state(module, prefix, **_kwargs):
         return {f"{prefix}{key}": value for key, value in module.state_dict().items()}
@@ -201,9 +234,23 @@ def test_bagel_flops_accumulate_packed_microbatches():
 
 
 def test_provider_rejects_unvalidated_model_parallel_topology():
-    provider = BagelModelProvider(tensor_model_parallel_size=2)
-    with pytest.raises(ValueError, match="TP=PP=CP=1"):
+    provider = BagelModelProvider(tensor_model_parallel_size=4)
+    with pytest.raises(ValueError, match="Unsupported BAGEL"):
         provider.finalize()
+
+
+def test_provider_requires_tensor_parallelism_for_sequence_parallelism():
+    provider = BagelModelProvider(sequence_parallel=True)
+    with pytest.raises(ValueError, match="requires tensor parallelism"):
+        provider.finalize()
+
+
+def test_provider_accepts_sequence_parallel_with_tp2():
+    provider = BagelModelProvider(tensor_model_parallel_size=2, sequence_parallel=True)
+
+    provider.finalize()
+
+    assert provider.sequence_parallel
 
 
 def test_provider_requires_complete_native_checkpoint_identity():
@@ -240,6 +287,12 @@ def test_reference_training_rng_matches_official_seed():
     np.random.seed(42)
     torch.manual_seed(42)
     assert actual == _draw_process_rng()
+
+
+def test_reference_training_seed_uses_data_parallel_identity():
+    assert _reference_training_rank_seed(42, 672, 16, 3, 16) == 675
+    with pytest.raises(RuntimeError, match="data-parallel world size"):
+        _reference_training_rank_seed(42, 1344, 32, 3, 16)
 
 
 def test_scheduler_initialization_preserves_process_rng(monkeypatch):

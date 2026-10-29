@@ -125,6 +125,12 @@ def main() -> None:
         "finetune": bagel_7b_finetune_8gpu_h100_bf16_config,
     }
     cfg = recipes[args.recipe]()
+    model_parallel_size = (
+        cfg.model.tensor_model_parallel_size * cfg.model.pipeline_model_parallel_size * cfg.model.context_parallel_size
+    )
+    if world_size % model_parallel_size:
+        raise ValueError("World size must be divisible by the BAGEL model-parallel size")
+    data_parallel_size = world_size // model_parallel_size
     cfg.checkpoint.ckpt_format = "fsdp_dtensor"
     cfg.model.bagel_repo = str(args.bagel_repo.resolve())
     cfg.model.model_path = str(args.model_path.resolve())
@@ -142,8 +148,8 @@ def main() -> None:
         cfg.dataset.dataloader_load = str(
             checkpoint.parent if is_checkpoint_iteration_directory(str(checkpoint)) else checkpoint
         )
-    cfg.model.reference_training_seed = args.seed * world_size
-    cfg.model.reference_training_world_size = world_size
+    cfg.model.reference_training_seed = args.seed * data_parallel_size
+    cfg.model.reference_training_world_size = data_parallel_size
     cfg.model.reset_reference_training_rng = True
     cfg.dataset.dataset_root = str(args.dataset_root.resolve())
     cfg.dataset.bagel_repo = str(args.bagel_repo.resolve())
@@ -154,7 +160,7 @@ def main() -> None:
         cfg.dataset.dataloader_save = str(args.checkpoint_output.resolve())
     cfg.train.train_iters = args.train_iters
     cfg.train.exit_interval = args.exit_interval
-    cfg.train.global_batch_size = world_size
+    cfg.train.global_batch_size = data_parallel_size
     cfg.rng.seed = args.seed
     cfg.logger.log_interval = 1
     cfg.logger.tensorboard_dir = str(args.tensorboard_dir.resolve()) if args.tensorboard_dir else None

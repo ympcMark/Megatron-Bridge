@@ -131,14 +131,16 @@ class BagelModelProvider(GPTModelProvider):
     reset_reference_training_rng: bool = False
 
     def finalize(self) -> None:
-        """Validate the first supported BAGEL training topology."""
+        """Validate the supported BAGEL training topologies."""
         topology = (
             self.tensor_model_parallel_size,
             self.pipeline_model_parallel_size,
             self.context_parallel_size,
         )
-        if topology != (1, 1, 1):
-            raise ValueError(f"BAGEL currently requires TP=PP=CP=1, got {topology}")
+        if topology not in ((1, 1, 1), (1, 1, 2), (2, 1, 1), (2, 1, 2)):
+            raise ValueError(f"Unsupported BAGEL TP/PP/CP topology: {topology}")
+        if self.sequence_parallel and self.tensor_model_parallel_size == 1:
+            raise ValueError("BAGEL sequence parallelism requires tensor parallelism")
         if self.native_model_checkpoint is None:
             if self.native_model_seed is not None or self.native_world_size is not None:
                 raise ValueError("BAGEL native seed/world size require native_model_checkpoint")
@@ -156,7 +158,6 @@ class BagelModelProvider(GPTModelProvider):
                 raise ValueError("BAGEL reference training seed and world size must be positive")
         elif reference_identity != (None, None):
             raise ValueError("BAGEL reference seed/world size require reset_reference_training_rng")
-        self.sequence_parallel = False
         self.variable_seq_lengths = True
         super().finalize()
 
@@ -271,8 +272,11 @@ class BagelModelProvider(GPTModelProvider):
         projection_config = TransformerConfig(
             num_layers=1,
             hidden_size=self.hidden_size,
-            num_attention_heads=1,
+            num_attention_heads=self.tensor_model_parallel_size,
             ffn_hidden_size=self.hidden_size,
+            tensor_model_parallel_size=self.tensor_model_parallel_size,
+            context_parallel_size=self.context_parallel_size,
+            sequence_parallel=False,
             activation_func=gelu_pytorch_tanh,
             add_bias_linear=True,
             bias_activation_fusion=False,

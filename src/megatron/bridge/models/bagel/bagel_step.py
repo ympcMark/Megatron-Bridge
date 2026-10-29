@@ -37,6 +37,22 @@ def _seed_reference_training_rng(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def _reference_training_rank_seed(
+    seed: int,
+    reference_seed: int,
+    reference_world_size: int,
+    dp_rank: int,
+    dp_size: int,
+) -> int:
+    """Return the official per-data-rank seed shared by model-parallel ranks."""
+    if reference_world_size != dp_size:
+        raise RuntimeError("BAGEL reference world size differs from the data-parallel world size")
+    model_seed = seed * dp_size
+    if reference_seed != model_seed:
+        raise RuntimeError("BAGEL reference seed differs from the training seed")
+    return model_seed + dp_rank
+
+
 def _initialize_scheduler(scheduler: BagelDiffusionScheduler) -> None:
     """Initialize the VAE without changing restored training RNG state."""
     python_rng = random.getstate()
@@ -127,6 +143,7 @@ class BagelForwardStep:
     ) -> tuple[torch.Tensor, partial]:
         """Prepare modalities, run MIMO, and bind the BAGEL loss."""
         config = state.cfg.model
+        pg_collection = get_pg_collection(model)
         if self.scheduler is None:
             if config.bagel_repo is None or config.vae_path is None:
                 raise ValueError("BAGEL training requires model.bagel_repo and model.vae_path")
@@ -140,13 +157,14 @@ class BagelForwardStep:
             _initialize_scheduler(self.scheduler)
         if config.reset_reference_training_rng and not self.reference_rng_seeded:
             if state.train_state.step == 0:
-                world_size = torch.distributed.get_world_size()
-                if config.reference_training_world_size != world_size:
-                    raise RuntimeError("BAGEL reference world size differs from the training world size")
-                model_seed = state.cfg.rng.seed * world_size
-                if config.reference_training_seed != model_seed:
-                    raise RuntimeError("BAGEL reference seed differs from the training seed")
-                _seed_reference_training_rng(model_seed + torch.distributed.get_rank())
+                rank_seed = _reference_training_rank_seed(
+                    state.cfg.rng.seed,
+                    config.reference_training_seed,
+                    config.reference_training_world_size,
+                    pg_collection.dp.rank(),
+                    pg_collection.dp.size(),
+                )
+                _seed_reference_training_rng(rank_seed)
             self.reference_rng_seeded = True
 
         state.timers("batch-generator", log_level=2).start()
@@ -156,6 +174,9 @@ class BagelForwardStep:
                 packed_batch,
                 self.scheduler,
                 num_attention_heads=config.num_attention_heads,
+                cp_rank=pg_collection.cp.rank(),
+                cp_size=pg_collection.cp.size(),
+                sequence_parallel_size=(pg_collection.tp.size() if config.sequence_parallel else 1),
             )
             _accumulate_bagel_flops_metadata(
                 state,
@@ -168,7 +189,6 @@ class BagelForwardStep:
         if not isinstance(output, tuple) or len(output) != 4:
             raise RuntimeError("BAGEL PP=1 model must return CE, MSE, MSE mask, and CE mask")
         ce_loss, mse_loss, mse_loss_mask, loss_mask = output
-        pg_collection = get_pg_collection(model)
         return ce_loss, partial(
             bagel_loss,
             loss_mask=loss_mask,
